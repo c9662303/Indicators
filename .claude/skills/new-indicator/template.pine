@@ -1,0 +1,33 @@
+// ─────────────────────────────────────────────────────────────
+// <Indicator Name>  v0.1.0
+// <One-line description>
+// ─────────────────────────────────────────────────────────────
+//@version=6
+indicator("<Indicator Name>", shorttitle = "<SHORT>", overlay = true)
+
+// ── Constants ────────────────────────────────────────────────
+GRP_MAIN   = "Main settings"
+GRP_STYLE  = "Style"
+GRP_ALERTS = "Alerts"
+
+// ── Inputs ───────────────────────────────────────────────────
+lenInput  = input.int(20, "Length", minval = 1, group = GRP_MAIN)
+srcInput  = input.source(close, "Source", group = GRP_MAIN)
+
+colInput  = input.color(color.teal, "Line colour", group = GRP_STYLE)
+
+// ── Calculations ─────────────────────────────────────────────
+value = ta.ema(srcInput, lenInput)
+
+// Signals only on closed bars so they never repaint.
+bullSignal = ta.crossover(srcInput, value) and barstate.isconfirmed
+bearSignal = ta.crossunder(srcInput, value) and barstate.isconfirmed
+
+// ── Plots ────────────────────────────────────────────────────
+plot(value, "Value", color = colInput, linewidth = 2)
+plotshape(bullSignal, "Bull", shape.triangleup,   location.belowbar, color.green, size = size.small)
+plotshape(bearSignal, "Bear", shape.triangledown, location.abovebar, color.red,   size = size.small)
+
+// ── Alerts ───────────────────────────────────────────────────
+alertcondition(bullSignal, "Bull signal", "{{ticker}} bull signal at {{close}}")
+alertcondition(bearSignal, "Bear signal", "{{ticker}} bear signal at {{close}}")

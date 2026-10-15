@@ -1,0 +1,274 @@
+// ─────────────────────────────────────────────────────────────
+// HTF Swing Lows  v0.2.0
+// Draws a line at the low of a higher-timeframe candle once the next HTF candle
+// has swept below it (dashed while forming, solid once it closed back above).
+// Swing definition and the timeframe visibility matrix adapted from
+// "TLM HTF Candles" (Mozilla Public License 2.0).
+// ─────────────────────────────────────────────────────────────
+//@version=6
+indicator("HTF Swing Lows", shorttitle = "HTF SL", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+// ── Constants ────────────────────────────────────────────────
+GRP_HTF    = "Higher timeframes"
+GRP_VIS    = "Show on chart timeframe"
+GRP_SWEEP  = "Which sweeps"
+GRP_STYLE  = "Style"
+
+// ── Inputs: higher timeframe slots ──────────────────────────
+show1Input = input.bool(true,  "HTF 1", group = GRP_HTF, inline = "h1")
+htf1Input  = input.timeframe("15",  "", group = GRP_HTF, inline = "h1")
+col1Input  = input.color(#2962FF, "",   group = GRP_HTF, inline = "h1")
+
+show2Input = input.bool(true,  "HTF 2", group = GRP_HTF, inline = "h2")
+htf2Input  = input.timeframe("30",  "", group = GRP_HTF, inline = "h2")
+col2Input  = input.color(#00897B, "",   group = GRP_HTF, inline = "h2")
+
+show3Input = input.bool(true,  "HTF 3", group = GRP_HTF, inline = "h3")
+htf3Input  = input.timeframe("60",  "", group = GRP_HTF, inline = "h3")
+col3Input  = input.color(#F57C00, "",   group = GRP_HTF, inline = "h3")
+
+show4Input = input.bool(true,  "HTF 4", group = GRP_HTF, inline = "h4")
+htf4Input  = input.timeframe("240", "", group = GRP_HTF, inline = "h4")
+col4Input  = input.color(#D32F2F, "",   group = GRP_HTF, inline = "h4")
+
+show5Input = input.bool(false, "HTF 5", group = GRP_HTF, inline = "h5")
+htf5Input  = input.timeframe("1D",  "", group = GRP_HTF, inline = "h5")
+col5Input  = input.color(#7B1FA2, "",   group = GRP_HTF, inline = "h5")
+
+show6Input = input.bool(false, "HTF 6", group = GRP_HTF, inline = "h6")
+htf6Input  = input.timeframe("1W",  "", group = GRP_HTF, inline = "h6")
+col6Input  = input.color(#616161, "",   group = GRP_HTF, inline = "h6")
+
+// ── Inputs: which HTFs show on which chart timeframe ────────
+// A row matches when the chart timeframe equals the row's timeframe. Its boxes 1-6 are the HTF slots above.
+// If the chart timeframe matches an enabled row, the row decides what shows (the HTF checkboxes above are ignored).
+// If no enabled row matches, the checkboxes above decide, and only HTFs higher than the chart timeframe are drawn.
+r1OnInput = input.bool(true, "Chart", group = GRP_VIS, inline = "r1", tooltip = "Tick the HTF numbers to draw on this chart timeframe. Numbers match HTF 1-6 above.")
+r1TfInput = input.timeframe("1", "", group = GRP_VIS, inline = "r1")
+r1H1Input = input.bool(true,  "1", group = GRP_VIS, inline = "r1")
+r1H2Input = input.bool(true,  "2", group = GRP_VIS, inline = "r1")
+r1H3Input = input.bool(false, "3", group = GRP_VIS, inline = "r1")
+r1H4Input = input.bool(false, "4", group = GRP_VIS, inline = "r1")
+r1H5Input = input.bool(false, "5", group = GRP_VIS, inline = "r1")
+r1H6Input = input.bool(false, "6", group = GRP_VIS, inline = "r1")
+
+r2OnInput = input.bool(true, "Chart", group = GRP_VIS, inline = "r2")
+r2TfInput = input.timeframe("3", "", group = GRP_VIS, inline = "r2")
+r2H1Input = input.bool(true,  "1", group = GRP_VIS, inline = "r2")
+r2H2Input = input.bool(true,  "2", group = GRP_VIS, inline = "r2")
+r2H3Input = input.bool(false, "3", group = GRP_VIS, inline = "r2")
+r2H4Input = input.bool(false, "4", group = GRP_VIS, inline = "r2")
+r2H5Input = input.bool(false, "5", group = GRP_VIS, inline = "r2")
+r2H6Input = input.bool(false, "6", group = GRP_VIS, inline = "r2")
+
+r3OnInput = input.bool(true, "Chart", group = GRP_VIS, inline = "r3")
+r3TfInput = input.timeframe("5", "", group = GRP_VIS, inline = "r3")
+r3H1Input = input.bool(false, "1", group = GRP_VIS, inline = "r3")
+r3H2Input = input.bool(false, "2", group = GRP_VIS, inline = "r3")
+r3H3Input = input.bool(true,  "3", group = GRP_VIS, inline = "r3")
+r3H4Input = input.bool(false, "4", group = GRP_VIS, inline = "r3")
+r3H5Input = input.bool(false, "5", group = GRP_VIS, inline = "r3")
+r3H6Input = input.bool(false, "6", group = GRP_VIS, inline = "r3")
+
+r4OnInput = input.bool(true, "Chart", group = GRP_VIS, inline = "r4")
+r4TfInput = input.timeframe("15", "", group = GRP_VIS, inline = "r4")
+r4H1Input = input.bool(false, "1", group = GRP_VIS, inline = "r4")
+r4H2Input = input.bool(false, "2", group = GRP_VIS, inline = "r4")
+r4H3Input = input.bool(false, "3", group = GRP_VIS, inline = "r4")
+r4H4Input = input.bool(true,  "4", group = GRP_VIS, inline = "r4")
+r4H5Input = input.bool(false, "5", group = GRP_VIS, inline = "r4")
+r4H6Input = input.bool(false, "6", group = GRP_VIS, inline = "r4")
+
+r5OnInput = input.bool(true, "Chart", group = GRP_VIS, inline = "r5")
+r5TfInput = input.timeframe("30", "", group = GRP_VIS, inline = "r5")
+r5H1Input = input.bool(false, "1", group = GRP_VIS, inline = "r5")
+r5H2Input = input.bool(false, "2", group = GRP_VIS, inline = "r5")
+r5H3Input = input.bool(false, "3", group = GRP_VIS, inline = "r5")
+r5H4Input = input.bool(true,  "4", group = GRP_VIS, inline = "r5")
+r5H5Input = input.bool(false, "5", group = GRP_VIS, inline = "r5")
+r5H6Input = input.bool(false, "6", group = GRP_VIS, inline = "r5")
+
+r6OnInput = input.bool(true, "Chart", group = GRP_VIS, inline = "r6")
+r6TfInput = input.timeframe("60", "", group = GRP_VIS, inline = "r6")
+r6H1Input = input.bool(false, "1", group = GRP_VIS, inline = "r6")
+r6H2Input = input.bool(false, "2", group = GRP_VIS, inline = "r6")
+r6H3Input = input.bool(false, "3", group = GRP_VIS, inline = "r6")
+r6H4Input = input.bool(true,  "4", group = GRP_VIS, inline = "r6")
+r6H5Input = input.bool(false, "5", group = GRP_VIS, inline = "r6")
+r6H6Input = input.bool(false, "6", group = GRP_VIS, inline = "r6")
+
+// ── Inputs: which sweeps ────────────────────────────────────
+showConfirmedInput = input.bool(true, "Confirmed (swept, closed back above)", group = GRP_SWEEP,
+  tooltip = "The HTF candle after the swing took out the low and closed back above it. Solid line by default.")
+showPotentialInput = input.bool(true, "Potential (swept, candle still open)", group = GRP_SWEEP,
+  tooltip = "The current HTF candle has taken out the previous low but has not closed yet. Dashed line by default. Removed if the candle closes below the low.")
+
+// ── Inputs: style ───────────────────────────────────────────
+lineWidthInput      = input.int(1, "Line width", minval = 1, maxval = 5, group = GRP_STYLE)
+confirmedStyleInput = input.string("Solid", "Confirmed style", options = ["Solid", "Dashed", "Dotted"], group = GRP_STYLE)
+potentialStyleInput = input.string("Dashed", "Potential style", options = ["Solid", "Dashed", "Dotted"], group = GRP_STYLE)
+overshootInput      = input.int(2, "Overshoot (bars)", minval = 0, maxval = 50, group = GRP_STYLE,
+  tooltip = "How many chart bars the line extends past the end of the sweeping candle.")
+showLabelsInput     = input.bool(true, "Show timeframe labels", group = GRP_STYLE)
+maxKeptInput        = input.int(5, "Confirmed lines kept per timeframe", minval = 1, maxval = 50, group = GRP_STYLE,
+  tooltip = "Older confirmed lines are deleted.")
+
+// ── Types ────────────────────────────────────────────────────
+type SwingLow
+    line ln
+    label lb
+
+type HtfTracker
+    string name
+    color col
+    float prevLow
+    int prevLowBar
+    float curLow
+    int curLowBar
+    float curClose
+    SwingLow active
+    array<SwingLow> kept
+
+// ── Which timeframes are active on this chart ───────────────
+chartSec = timeframe.in_seconds()
+
+rowMatch(bool on, string tf) =>
+    on and timeframe.in_seconds(tf) == chartSec
+
+on1 = rowMatch(r1OnInput, r1TfInput)
+on2 = rowMatch(r2OnInput, r2TfInput)
+on3 = rowMatch(r3OnInput, r3TfInput)
+on4 = rowMatch(r4OnInput, r4TfInput)
+on5 = rowMatch(r5OnInput, r5TfInput)
+on6 = rowMatch(r6OnInput, r6TfInput)
+anyRow = on1 or on2 or on3 or on4 or on5 or on6
+
+row1 = array.from(r1H1Input, r1H2Input, r1H3Input, r1H4Input, r1H5Input, r1H6Input)
+row2 = array.from(r2H1Input, r2H2Input, r2H3Input, r2H4Input, r2H5Input, r2H6Input)
+row3 = array.from(r3H1Input, r3H2Input, r3H3Input, r3H4Input, r3H5Input, r3H6Input)
+row4 = array.from(r4H1Input, r4H2Input, r4H3Input, r4H4Input, r4H5Input, r4H6Input)
+row5 = array.from(r5H1Input, r5H2Input, r5H3Input, r5H4Input, r5H5Input, r5H6Input)
+row6 = array.from(r6H1Input, r6H2Input, r6H3Input, r6H4Input, r6H5Input, r6H6Input)
+
+// k is the zero-based HTF slot. A matching row overrides the slot's own checkbox.
+slotWanted(int k, bool slotOn) =>
+    anyRow ? ((on1 and row1.get(k)) or (on2 and row2.get(k)) or (on3 and row3.get(k)) or (on4 and row4.get(k)) or (on5 and row5.get(k)) or (on6 and row6.get(k))) : slotOn
+
+// A slot is only drawn when its timeframe is higher than the chart timeframe.
+active1 = slotWanted(0, show1Input) and timeframe.in_seconds(htf1Input) > chartSec
+active2 = slotWanted(1, show2Input) and timeframe.in_seconds(htf2Input) > chartSec
+active3 = slotWanted(2, show3Input) and timeframe.in_seconds(htf3Input) > chartSec
+active4 = slotWanted(3, show4Input) and timeframe.in_seconds(htf4Input) > chartSec
+active5 = slotWanted(4, show5Input) and timeframe.in_seconds(htf5Input) > chartSec
+active6 = slotWanted(5, show6Input) and timeframe.in_seconds(htf6Input) > chartSec
+
+// HTF candle boundaries. An inactive slot falls back to the chart timeframe so the call is always valid.
+new1 = timeframe.change(active1 ? htf1Input : timeframe.period)
+new2 = timeframe.change(active2 ? htf2Input : timeframe.period)
+new3 = timeframe.change(active3 ? htf3Input : timeframe.period)
+new4 = timeframe.change(active4 ? htf4Input : timeframe.period)
+new5 = timeframe.change(active5 ? htf5Input : timeframe.period)
+new6 = timeframe.change(active6 ? htf6Input : timeframe.period)
+
+// ── Helpers ──────────────────────────────────────────────────
+lineStyleOf(string s) =>
+    switch s
+        "Dashed" => line.style_dashed
+        "Dotted" => line.style_dotted
+        => line.style_solid
+
+confirmedStyle = lineStyleOf(confirmedStyleInput)
+potentialStyle = lineStyleOf(potentialStyleInput)
+
+// "15" -> "15m", "240" -> "4H", "1D" -> "1D"
+tfLabel(string tf) =>
+    int sec = timeframe.in_seconds(tf)
+    string out = ""
+    if sec >= 2592000
+        out := str.tostring(math.round(sec / 2592000.0)) + "M"
+    else if sec >= 604800
+        out := str.tostring(math.round(sec / 604800.0)) + "W"
+    else if sec >= 86400
+        out := str.tostring(math.round(sec / 86400.0)) + "D"
+    else if sec >= 3600
+        out := str.tostring(math.round(sec / 3600.0)) + "H"
+    else if sec >= 60
+        out := str.tostring(math.round(sec / 60.0)) + "m"
+    else
+        out := str.tostring(sec) + "s"
+    out
+
+method erase(SwingLow this) =>
+    line.delete(this.ln)
+    label.delete(this.lb)
+
+// Creates the active swing line, or moves and restyles it if it already exists.
+method draw(HtfTracker this, int x1, float y, int x2, bool confirmed) =>
+    string style = confirmed ? confirmedStyle : potentialStyle
+    if na(this.active)
+        line ln = line.new(x1, y, x2, y, color = this.col, style = style, width = lineWidthInput)
+        label lb = showLabelsInput ? label.new(x2, y, this.name, color = color(na), style = label.style_label_left, textcolor = this.col, size = size.tiny) : na
+        this.active := SwingLow.new(ln, lb)
+    else
+        SwingLow s = this.active
+        line.set_xy1(s.ln, x1, y)
+        line.set_xy2(s.ln, x2, y)
+        line.set_style(s.ln, style)
+        if not na(s.lb)
+            label.set_xy(s.lb, x2, y)
+    true
+
+// Called once per confirmed chart bar. Tracks the previous and the forming HTF candle (only their lows and close matter).
+method update(HtfTracker this, bool newHtf) =>
+    if newHtf or na(this.curLow)
+        // The previous HTF candle closed on bar_index - 1. Settle the line for the (earlier, previous) pair.
+        bool confirmed = not na(this.prevLow) and this.curLow < this.prevLow and this.curClose > this.prevLow
+        if confirmed and showConfirmedInput
+            this.draw(this.prevLowBar, this.prevLow, bar_index - 1 + overshootInput, true)
+            this.kept.push(this.active)
+            if this.kept.size() > maxKeptInput
+                SwingLow oldest = this.kept.shift()
+                oldest.erase()
+        else if not na(this.active)
+            this.active.erase()
+        this.active := na
+        this.prevLow := this.curLow
+        this.prevLowBar := this.curLowBar
+        this.curLow := low
+        this.curLowBar := bar_index
+    else if low < this.curLow
+        this.curLow := low
+        this.curLowBar := bar_index
+    this.curClose := close
+
+    // Has the forming candle swept the previous candle's low?
+    if showPotentialInput and not na(this.prevLow) and this.curLow < this.prevLow
+        this.draw(this.prevLowBar, this.prevLow, bar_index + overshootInput, false)
+    else if not na(this.active)
+        this.active.erase()
+        this.active := na
+    true
+
+// ── Trackers (one per higher timeframe slot) ─────────────────
+var HtfTracker t1 = HtfTracker.new(name = tfLabel(htf1Input), col = col1Input, kept = array.new<SwingLow>())
+var HtfTracker t2 = HtfTracker.new(name = tfLabel(htf2Input), col = col2Input, kept = array.new<SwingLow>())
+var HtfTracker t3 = HtfTracker.new(name = tfLabel(htf3Input), col = col3Input, kept = array.new<SwingLow>())
+var HtfTracker t4 = HtfTracker.new(name = tfLabel(htf4Input), col = col4Input, kept = array.new<SwingLow>())
+var HtfTracker t5 = HtfTracker.new(name = tfLabel(htf5Input), col = col5Input, kept = array.new<SwingLow>())
+var HtfTracker t6 = HtfTracker.new(name = tfLabel(htf6Input), col = col6Input, kept = array.new<SwingLow>())
+
+// ── Logic ────────────────────────────────────────────────────
+// Everything runs on closed chart bars only, so nothing repaints.
+if barstate.isconfirmed
+    if active1
+        t1.update(new1)
+    if active2
+        t2.update(new2)
+    if active3
+        t3.update(new3)
+    if active4
+        t4.update(new4)
+    if active5
+        t5.update(new5)
+    if active6
+        t6.update(new6)
