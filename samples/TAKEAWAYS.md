@@ -19,3 +19,15 @@ if newHtf
 else
     htfLow := math.min(htfLow, low)   // htfLow declared with var
 ```
+
+### CISD level = extreme open of the latest same-direction candle run
+Source: samples/Cisd.pine · Use when: marking where a change in state of delivery happens
+```pine
+// bias 1: level = lowest open of the latest run of bullish candles (dojis skipped); bias -1: highest open of bearish run
+// bias bearish and close > level  -> bullish CISD, flip bias
+// bias bullish and close < level  -> bearish CISD, flip bias
+// new high/low in the bias direction moves the level to the latest run
+```
+
+### Run every state-machine update on barstate.isconfirmed
+Source: built in indicators/htf-swing-lows · Use when: a script keeps arrays or drawings that must not be duplicated by realtime ticks
