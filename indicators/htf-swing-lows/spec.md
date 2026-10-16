@@ -90,6 +90,21 @@ line style and width, bullish/bearish colours, label on/off, position and size.
 The filter only hides lines; the bias still flips on hidden triggers.
 Not included from the sample: active-level plot, debug plot, multi-timeframe trend table, alerts.
 
+## Proposed v1.0.0 (in the browser preview only, not yet in the Pine code)
+Requested 2026-10-16 after reviewing the preview:
+- **No labels** anywhere (swing lines, CISD lines, pending lines).
+- **CISD timeframe is tied to the swept HTF, not the chart timeframe**:
+  15m sweep -> 1m and 3m CISD, 30m sweep -> 3m CISD, 1H sweep -> 5m CISD (editable per HTF slot).
+  CISD candles are built from chart candles, so a CISD timeframe only works when it is a multiple of the chart timeframe
+  (e.g. on a 3m chart: 3m CISD works, 1m and 5m do not).
+- **Order**: a CISD only counts if it triggers after the sweep started, inside the sweep's window
+  (sweeping HTF candle + N more). The first CISD per sweep per CISD timeframe is drawn; later ones are ignored.
+- **One line per swept low**: lows swept by several HTFs at once (e.g. the previous 15m low is also the 30m and 1H low)
+  draw one line in the highest HTF's colour, and that sweep looks for every paired CISD (1m, 3m, 5m).
+  The sweep line runs from the low to its CISD. The separate "swing low the CISD comes from" line is removed.
+- CISD timeframes are told apart by colour and thickness: 1m light green thin, 3m green, 5m dark green thick.
+- Default rows: 1m and 3m charts show 15m, 30m, 1H sweeps; 30s shows 5m, 15m; 5m shows 1H; 15m to 1H show 4H.
+
 ## Outputs
 Lines and optional labels (no plots), plus a status table at the bottom right (v0.6.0, can be turned off):
 chart timeframe, matched settings row, active HTFs, swing low currently being come out of, CISD bias.

@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HTF Swing Lows + CISD — Preview</title>
+<style>
+  :root {
+    --bg: #ffffff; --panel: #f7f7f8; --border: #e2e2e5; --text: #1f2328; --muted: #6b7280; --accent: #2962FF;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: var(--text); background: var(--bg); }
+  .app { display: grid; grid-template-columns: 290px 1fr; height: 100vh; }
+  aside { background: var(--panel); border-right: 1px solid var(--border); overflow-y: auto; padding: 12px 14px 24px; }
+  main { display: grid; grid-template-rows: auto auto 1fr; min-width: 0; }
+  h1 { font-size: 14px; margin: 0 0 2px; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+  fieldset { border: 1px solid var(--border); border-radius: 6px; margin: 0 0 10px; padding: 8px 10px 10px; background: #fff; }
+  legend { font-weight: 600; font-size: 12px; padding: 0 4px; }
+  label.row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 4px 0; }
+  label.check { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+  input[type=number] { width: 70px; }
+  .slots { display: grid; grid-template-columns: auto 1fr; gap: 3px 8px; align-items: center; }
+  .pairs { display: flex; gap: 6px; color: var(--muted); font-size: 12px; }
+  .pairs label { display: flex; align-items: center; gap: 2px; }
+  .legend { display: grid; grid-template-columns: auto 1fr; gap: 3px 8px; align-items: center; font-size: 12px; }
+  .legend i { display: inline-block; width: 26px; border-top-style: solid; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+  .btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  button { font: inherit; padding: 4px 10px; border: 1px solid var(--border); background: #fff; border-radius: 5px; cursor: pointer; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+  /* TradingView-style header */
+  .header { display: flex; align-items: center; gap: 4px; padding: 6px 10px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .header select { font: inherit; font-weight: 600; padding: 4px 6px; border: 1px solid transparent; border-radius: 4px; background: transparent; cursor: pointer; }
+  .header select:hover { background: #f0f3fa; }
+  .sep { width: 1px; height: 20px; background: var(--border); margin: 0 6px; }
+  .tf { border: none; background: transparent; padding: 4px 8px; border-radius: 4px; color: var(--text); font-weight: 500; }
+  .tf:hover:not(:disabled) { background: #f0f3fa; }
+  .tf.on { color: var(--accent); background: #e3ebff; }
+  .tf:disabled { color: #c4c7cc; cursor: default; }
+
+  .toolbar { display: flex; align-items: center; gap: 12px; padding: 4px 12px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 12px; min-height: 26px; flex-wrap: wrap; }
+  .toolbar b { color: var(--text); }
+  .err { color: #c62828; }
+  .chartWrap { position: relative; min-height: 0; }
+  #chart { position: absolute; inset: 0; }
+  #status { position: absolute; right: 70px; bottom: 34px; z-index: 4; background: rgba(128,128,128,.15); border-radius: 4px; font-size: 11px; border-collapse: collapse; }
+  #status td { padding: 2px 6px; border: 1px solid rgba(128,128,128,.25); }
+  .note { color: var(--muted); font-size: 11px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside>
+    <h1>HTF Swing Lows + CISD</h1>
+    <div class="sub">Browser preview of the <b>proposed v1.0.0</b> logic (not in the Pine code yet). TradingView is still the final check.</div>
+
+    <fieldset>
+      <legend>Other data</legend>
+      <label class="row">Binance symbol
+        <input id="symbol" type="text" value="BTCUSDT" list="symbols" size="10">
+      </label>
+      <datalist id="symbols"><option>BTCUSDT</option><option>ETHUSDT</option><option>SOLUSDT</option><option>BNBUSDT</option><option>XRPUSDT</option></datalist>
+      <label class="row">Binance bars <input id="bars" type="number" value="1000" min="100" max="3000" step="100"></label>
+      <div class="btns">
+        <button class="primary" id="load">Load Binance</button>
+        <button id="csvBtn">Load CSV…</button>
+        <button id="random">Random data</button>
+        <input id="csv" type="file" accept=".csv,text/csv" hidden>
+      </div>
+      <div class="note">CSV: TradingView "Export chart data" (time, open, high, low, close). Binance 30s builds bars from 1-second candles, so it takes a few seconds.</div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Sweeps on this chart → CISD timeframes</legend>
+      <div class="slots" id="slots"></div>
+      <div class="note" id="rowNote"></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Which sweeps</legend>
+      <label class="check"><input id="showConfirmed" type="checkbox" checked> Confirmed (closed back above)</label>
+      <label class="check"><input id="showPotential" type="checkbox" checked> Potential (candle still open)</label>
+    </fieldset>
+
+    <fieldset>
+      <legend>Style</legend>
+      <label class="row">Line width <input id="lineWidth" type="number" value="1" min="1" max="5"></label>
+      <label class="row">Overshoot (bars) <input id="overshoot" type="number" value="2" min="0" max="50"></label>
+      <label class="row">Sweeps kept per TF <input id="maxKept" type="number" value="50" min="1" max="100"></label>
+    </fieldset>
+
+    <fieldset>
+      <legend>CISD (chart timeframe)</legend>
+      <label class="check"><input id="cisdShow" type="checkbox" checked> Show CISD lines</label>
+      <label class="check"><input id="cisdGate" type="checkbox" checked> Only out of an HTF swing low</label>
+      <label class="row">HTF candles to wait <input id="cisdWait" type="number" value="1" min="0" max="10"></label>
+      <label class="check"><input id="cisdPending" type="checkbox" checked> Show pending level</label>
+      <label class="row">Triggered
+        <select id="cisdFilter"><option>Both</option><option>Bullish Only</option><option>Bearish Only</option></select>
+      </label>
+      <label class="row">Max CISD kept <input id="cisdMax" type="number" value="50" min="1" max="200"></label>
+      <label class="row">Extend (bars) <input id="cisdExtend" type="number" value="0" min="0" max="50"></label>
+      <div class="legend" id="legend"></div>
+    </fieldset>
+    <div class="note">Lines that reach past the last bar are cut at the last bar here; TradingView draws them into the future.</div>
+  </aside>
+
+  <main>
+    <div class="header">
+      <select id="source" title="Data">
+        <option value="nq">NQ1! · last 30 days</option>
+        <option value="binance">Crypto (Binance)</option>
+        <option value="random">Random data</option>
+        <option value="csv" disabled>CSV</option>
+      </select>
+      <div class="sep"></div>
+      <div id="tfs"></div>
+    </div>
+    <div class="toolbar" id="toolbar">Loading…</div>
+    <div class="chartWrap">
+      <div id="chart"></div>
+      <table id="status"></table>
+    </div>
+  </main>
+</div>
+
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<script src="engine.js"></script>
+<script src="data/nq-1m.js"></script>
+<script>
+"use strict";
+const E = window.PreviewEngine;
+const $ = (id) => document.getElementById(id);
+const TZ = -new Date().getTimezoneOffset() * 60; // show local time on the chart
+const TFS = [30, 60, 180, 300, 900, 1800, 3600];
+
+let source = "nq";
+// Local sources (NQ, CSV, random) keep their base candles and build each chart timeframe from them.
+let base = { bars: [], sec: 60, anchor: 0, name: "" };
+let bars = [];          // candles on the chart timeframe: [{t,o,h,l,c}] oldest first, t = unix seconds (UTC)
+let lastBarLive = false;
+let anchorSec = 0;
+let chartSec = 60;
+let sourceText = "";
+
+// ── Chart ─────────────────────────────────────────────────
+const chart = LightweightCharts.createChart($("chart"), {
+  autoSize: true,
+  layout: { background: { color: "#ffffff" }, textColor: "#333" },
+  grid: { vertLines: { color: "#f2f2f2" }, horzLines: { color: "#f2f2f2" } },
+  timeScale: { timeVisible: true, secondsVisible: false, rightOffset: 8 },
+  crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+});
+const candles = chart.addCandlestickSeries({
+  upColor: "#e6e6e6", borderUpColor: "#9e9e9e", wickUpColor: "#757575",
+  downColor: "#555555", borderDownColor: "#555555", wickDownColor: "#555555",
+});
+let lineSeries = [];
+const STYLE = { solid: LightweightCharts.LineStyle.Solid, dashed: LightweightCharts.LineStyle.Dashed, dotted: LightweightCharts.LineStyle.Dotted };
+
+// ── Timeframe header ──────────────────────────────────────
+function buildTfButtons() {
+  $("tfs").innerHTML = TFS.map((s) => `<button class="tf" data-tf="${s}">${E.tfName(s)}</button>`).join("");
+  $("tfs").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-tf]");
+    if (b && !b.disabled) selectTf(+b.dataset.tf);
+  });
+}
+
+function tfAvailable(sec) {
+  if (source === "binance") return true;
+  return sec >= base.sec && sec % base.sec === 0;
+}
+
+function updateTfButtons() {
+  document.querySelectorAll("[data-tf]").forEach((b) => {
+    const s = +b.dataset.tf;
+    b.disabled = !tfAvailable(s);
+    b.classList.toggle("on", s === chartSec);
+    b.title = b.disabled ? `Not available: this data starts at ${E.tfName(base.sec)}` : "";
+  });
+}
+
+function selectTf(sec) {
+  if (!tfAvailable(sec)) sec = TFS.find(tfAvailable) ?? base.sec;
+  chartSec = sec;
+  updateTfButtons();
+  if (source === "binance") { loadBinance(); return; }
+  bars = aggregate(base.bars, chartSec, base.anchor);
+  lastBarLive = false;
+  anchorSec = base.anchor;
+  sourceText = base.name;
+  applySlotDefaults();
+  render(true);
+}
+
+// ── Data ──────────────────────────────────────────────────
+function aggregate(src, sec, anchor = 0) {
+  const out = [];
+  for (const b of src) {
+    const t = Math.floor((b.t - anchor) / sec) * sec + anchor;
+    const last = out[out.length - 1];
+    if (last && last.t === t) { last.h = Math.max(last.h, b.h); last.l = Math.min(last.l, b.l); last.c = b.c; }
+    else out.push({ t, o: b.o, h: b.h, l: b.l, c: b.c });
+  }
+  return out;
+}
+
+function useLocal(src, name, data, sec, anchor) {
+  source = src;
+  base = { bars: data, sec, anchor, name };
+  $("source").value = src;
+  selectTf(tfAvailable(chartSec) ? chartSec : sec);
+}
+
+function loadNQ() {
+  const d = window.SAMPLE_DATA && window.SAMPLE_DATA.NQ;
+  if (!d) { setToolbar('<span class="err">data/nq-1m.js is missing.</span>'); return; }
+  const data = d.bars.map((r) => ({ t: r[0], o: r[1], h: r[2], l: r[3], c: r[4] }));
+  useLocal("nq", `NQ1! (Yahoo NQ=F) · ${d.from} → ${d.to}`, data, 60, d.sessionAnchorSec);
+}
+
+function loadRandom() {
+  const n = 6000, sec = 60;
+  const now = Math.floor(Date.now() / 1000 / sec) * sec;
+  let p = 100, seed = 7;
+  const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  const data = [];
+  for (let i = 0; i < n; i++) {
+    const o = p, vol = 0.25;
+    const c = o + (rnd() - 0.5) * vol * 2 + Math.sin(i / 40) * vol * 0.15;
+    data.push({ t: now - (n - 1 - i) * sec, o, h: Math.max(o, c) + rnd() * vol * 0.8, l: Math.min(o, c) - rnd() * vol * 0.8, c });
+    p = c;
+  }
+  useLocal("random", "Random data (1m base)", data, sec, 0);
+}
+
+function loadCsv(text, name) {
+  const rows = text.trim().split(/\r?\n/);
+  const head = rows[0].split(",").map((s) => s.trim().toLowerCase().replace(/"/g, ""));
+  const col = (k) => head.findIndex((h) => h === k || h.startsWith(k));
+  const it = col("time"), io = col("open"), ih = col("high"), il = col("low"), ic = col("close");
+  if ([it, io, ih, il, ic].some((x) => x < 0)) { setToolbar('<span class="err">CSV needs time, open, high, low, close columns.</span>'); return; }
+  const out = [];
+  for (const r of rows.slice(1)) {
+    const f = r.split(",");
+    let t = f[it].replace(/"/g, "").trim();
+    t = /^\d+(\.\d+)?$/.test(t) ? +t : Date.parse(t) / 1000;
+    if (t > 1e12) t = t / 1000;
+    const b = { t: Math.floor(t), o: +f[io], h: +f[ih], l: +f[il], c: +f[ic] };
+    if ([b.t, b.o, b.h, b.l, b.c].every(Number.isFinite)) out.push(b);
+  }
+  out.sort((a, b) => a.t - b.t);
+  if (out.length < 20) { setToolbar('<span class="err">CSV has too few rows.</span>'); return; }
+  const diffs = out.slice(1, 200).map((b, i) => b.t - out[i].t).sort((a, b) => a - b);
+  const sec = diffs[Math.floor(diffs.length / 2)];
+  $("source").querySelector('[value="csv"]').disabled = false;
+  useLocal("csv", `CSV ${name}`, out, sec, 0);
+}
+
+const BINANCE = ["https://data-api.binance.vision", "https://api.binance.com"];
+const INTERVAL = { 60: "1m", 180: "3m", 300: "5m", 900: "15m", 1800: "30m", 3600: "1h" };
+
+async function fetchKlines(symbol, interval, total) {
+  let lastErr;
+  for (const host of BINANCE) {
+    try {
+      let out = [];
+      let endTime = null;
+      while (out.length < total) {
+        const limit = Math.min(1000, total - out.length);
+        let url = `${host}/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit}`;
+        if (endTime !== null) url += `&endTime=${endTime}`;
+        const r = await fetch(url);
+        if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+        const d = await r.json();
+        if (!d.length) break;
+        out = d.concat(out);
+        endTime = d[0][0] - 1;
+        if (d.length < limit) break;
+      }
+      return out.map((k) => ({ t: k[0] / 1000, o: +k[1], h: +k[2], l: +k[3], c: +k[4] }));
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr;
+}
+
+async function loadBinance() {
+  source = "binance";
+  $("source").value = "binance";
+  updateTfButtons();
+  const symbol = $("symbol").value.trim().toUpperCase();
+  const count = Math.max(100, Math.min(3000, +$("bars").value || 1000));
+  setToolbar(`Loading ${symbol} ${E.tfName(chartSec)} from Binance…`);
+  try {
+    bars = chartSec === 30
+      ? aggregate(await fetchKlines(symbol, "1s", count * 30), 30)
+      : await fetchKlines(symbol, INTERVAL[chartSec], count);
+    lastBarLive = true;
+    anchorSec = 0;
+    sourceText = `Binance ${symbol}`;
+    applySlotDefaults();
+    render(true);
+  } catch (e) {
+    setToolbar(`<span class="err">Could not load from Binance (${escapeHtml(String(e.message || e))}).</span>`);
+  }
+}
+
+// ── Settings ──────────────────────────────────────────────
+function buildSlotBoxes() {
+  const pairBoxes = (k) => E.CISD_TFS.filter((d) => d.sec < E.SLOTS[k].sec).map((d) =>
+    `<label><input type="checkbox" data-pair="${k}" value="${d.sec}"${E.SLOTS[k].pairs.includes(d.sec) ? " checked" : ""}>${d.name}</label>`).join("");
+  $("slots").innerHTML = E.SLOTS.map((s, k) =>
+    `<label class="check"><input type="checkbox" data-slot="${k}"> <span class="swatch" style="background:${s.color}"></span>${s.name}</label>` +
+    `<div class="pairs">CISD ${pairBoxes(k)}</div>`
+  ).join("");
+  $("slots").addEventListener("change", () => render(false));
+  $("legend").innerHTML = E.CISD_TFS.map((d) =>
+    `<i style="border-top-color:${d.color};border-top-width:${d.width + 1}px"></i><span>${d.name} CISD (dashed = pending)</span>`).join("");
+}
+
+// Tick the boxes the default settings rows would tick for this chart timeframe.
+function applySlotDefaults() {
+  const { row, wanted } = E.defaultSlotsFor(chartSec);
+  document.querySelectorAll("[data-slot]").forEach((el) => {
+    const k = +el.dataset.slot;
+    el.checked = wanted[k];
+    el.disabled = E.SLOTS[k].sec <= chartSec;
+  });
+  $("rowNote").textContent = row >= 0
+    ? `Ticked from default settings row ${row + 1} for ${E.tfName(chartSec)} charts. Change them to try other combinations.`
+    : `No default row for ${E.tfName(chartSec)}, so the HTF 1-6 checkboxes apply.`;
+}
+
+function options() {
+  const num = (id) => +$(id).value;
+  const chk = (id) => $(id).checked;
+  return {
+    chartSec, lastBarLive, anchorSec,
+    wanted: [...document.querySelectorAll("[data-slot]")].map((el) => el.checked),
+    showConfirmed: chk("showConfirmed"), showPotential: chk("showPotential"),
+    confirmedStyle: "solid", potentialStyle: "dashed",
+    lineWidth: num("lineWidth"), overshoot: num("overshoot"), maxKept: num("maxKept"),
+    pairs: E.SLOTS.map((_, k) => [...document.querySelectorAll(`[data-pair="${k}"]:checked`)].map((el) => +el.value)),
+    cisd: {
+      show: chk("cisdShow"), gate: chk("cisdGate"), wait: num("cisdWait"), pending: chk("cisdPending"),
+      filter: $("cisdFilter").value, max: num("cisdMax"), extend: num("cisdExtend"),
+      bearColor: "#c62828",
+    },
+  };
+}
+
+// ── Render ────────────────────────────────────────────────
+const T = (x) => bars[Math.max(0, Math.min(bars.length - 1, x))].t + TZ;
+
+function render(fit) {
+  if (!bars.length) return;
+  chart.applyOptions({ timeScale: { secondsVisible: chartSec < 60 } });
+  candles.setData(bars.map((b) => ({ time: b.t + TZ, open: b.o, high: b.h, low: b.l, close: b.c })));
+  const res = E.run(bars, options());
+
+  for (const s of lineSeries) chart.removeSeries(s);
+  lineSeries = [];
+  const last = bars.length - 1;
+  for (const ln of res.lines) {
+    if (ln.x1 === null || ln.y === null) continue;
+    const x1 = Math.max(0, ln.x1);
+    let x2 = Math.min(ln.x2, last);
+    if (x2 <= x1) x2 = Math.min(x1 + 1, last);
+    if (x2 <= x1) continue;
+    const s = chart.addLineSeries({
+      color: ln.color, lineWidth: ln.width, lineStyle: STYLE[ln.style] ?? STYLE.solid,
+      lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false,
+    });
+    s.setData([{ time: T(x1), value: ln.y }, { time: T(x2), value: ln.y }]);
+    lineSeries.push(s);
+  }
+
+  const s = res.status;
+  $("status").innerHTML = [
+    ["Chart", s.chart], ["Settings row", s.row], ["Sweeps", s.sweeps],
+    ["Coming out of", s.comingOutOf], ["CISD", s.cisd],
+  ].map(([k, v]) => `<tr><td>${k}</td><td>${escapeHtml(v)}</td></tr>`).join("");
+
+  const warn = s.lines > 500 ? ` · <span class="err">over 500 lines: TradingView would drop the oldest</span>` : "";
+  setToolbar(`<b>${escapeHtml(sourceText)}</b> · ${E.tfName(chartSec)} · ${bars.length} bars${lastBarLive ? " (last bar still forming, ignored like on TradingView)" : ""} · ${s.lines} lines${warn}`);
+  if (fit) {
+    chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, bars.length - 200), to: bars.length + 8 });
+  }
+}
+
+function setToolbar(html) { $("toolbar").innerHTML = html; }
+function escapeHtml(s) { return String(s).replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch])); }
+
+// ── Wire up ───────────────────────────────────────────────
+buildTfButtons();
+buildSlotBoxes();
+$("source").addEventListener("change", (e) => {
+  const v = e.target.value;
+  if (v === "nq") loadNQ();
+  else if (v === "binance") loadBinance();
+  else if (v === "random") loadRandom();
+  else if (v === "csv") $("csv").click();
+});
+$("load").addEventListener("click", loadBinance);
+$("random").addEventListener("click", loadRandom);
+$("csvBtn").addEventListener("click", () => $("csv").click());
+$("csv").addEventListener("change", async (e) => {
+  const f = e.target.files[0];
+  if (f) loadCsv(await f.text(), f.name);
+  e.target.value = "";
+});
+document.querySelectorAll("aside fieldset:not(:first-of-type) input, aside fieldset:not(:first-of-type) select")
+  .forEach((el) => el.addEventListener("change", () => render(false)));
+
+loadNQ();
+</script>
+</body>
+</html>
