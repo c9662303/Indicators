@@ -190,6 +190,11 @@ const HTF_TIMEFRAMES = [
     { key: '1h',  label: '1H',  ms: 60 * 60000 },
 ];
 const HOUR_MS = 3600000;
+// HTF candle colours (bullish / bearish), TradingView style: body, border, wick.
+const HTF_COLORS = {
+    bull: { body: '#e1e1df', border: '#696d7a', wick: '#696d7a' },
+    bear: { body: '#696d7a', border: '#696d7a', wick: '#696d7a' },
+};
 
 // Groups price levels into buckets of `modifiedSize`, exactly as the chart-bar
 // bubbles do above, so an HTF candle's bubbles match what that timeframe's
@@ -733,7 +738,7 @@ class BigTradeDeltaAbsorption {
         const tick         = this.contractInfo.tickSize;
         const modifiedSize = tick * this.props.priceLevelsPerBar;
         const width        = this.props.HtfCandleWidth;
-        const volThreshold = this.props.RthVolThreshold;
+        const volThreshold = this.props.HtfVolThreshold;
         let x = d.index() + this.props.HtfOffsetBars;
 
         HTF_TIMEFRAMES.forEach(tf => {
@@ -757,9 +762,9 @@ class BigTradeDeltaAbsorption {
             candles.forEach(({ bucket, candle }) => {
                 const { o, h, l, c } = candle;
                 const cx = x + width / 2;
-                const bodyColor = c >= o ? this.props.HtfUpColor : this.props.HtfDownColor;
+                const colors = c >= o ? HTF_COLORS.bull : HTF_COLORS.bear;
 
-                // Wick, then body
+                // Wick, then body with its border
                 container.children.push({
                     tag: 'Shapes', key: `htf_${tf.key}_${bucket}_wick`,
                     primitives: [{
@@ -767,7 +772,7 @@ class BigTradeDeltaAbsorption {
                         position: { x: op(du(cx), '-', px(1)), y: du(l) },
                         size: { height: du(h - l), width: px(2) }
                     }],
-                    fillStyle: { color: bodyColor }
+                    fillStyle: { color: colors.wick }
                 });
                 container.children.push({
                     tag: 'Shapes', key: `htf_${tf.key}_${bucket}_body`,
@@ -776,7 +781,8 @@ class BigTradeDeltaAbsorption {
                         position: { x: du(x), y: du(Math.min(o, c)) },
                         size: { height: du(Math.max(Math.abs(c - o), tick / 4)), width: du(width) }
                     }],
-                    fillStyle: { color: bodyColor }
+                    fillStyle: { color: colors.body },
+                    lineStyle: { lineWidth: 1, color: colors.border }
                 });
 
                 // Bubbles: same threshold, sizing and colours as the chart bubbles,
@@ -882,8 +888,7 @@ module.exports = {
         EnableHtfCandles:   predef.paramSpecs.bool(true),
         HtfOffsetBars:      predef.paramSpecs.number(5, 1, 1),
         HtfCandleWidth:     predef.paramSpecs.number(3, 1, 1),
-        HtfUpColor:         predef.paramSpecs.color('#B2B5BE'),
-        HtfDownColor:       predef.paramSpecs.color('#5D606B'),
+        HtfVolThreshold:    predef.paramSpecs.number(155, 1, 0),
 
         // ── PRICE AXIS DELTA & VOLUME ─────────────────────────────────────────
         divider2:           predef.paramSpecs.enum({ s: '━━━━━━━━━━  PRICE AXIS DELTA & VOLUME  ━━━━━━━━━━' }, 's'),
