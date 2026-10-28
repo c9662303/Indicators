@@ -181,6 +181,18 @@ function dayKeyFor(sessionKey, barUtcMs) {
     return `${sessionKey}_${window.startMs}`;
 }
 
+// ── BUBBLE LOOK ──────────────────────────────────────────────────────────────
+// One fixed size for every bubble (chart and HTF), with bold white numbers
+// sized to fit inside it.
+function bubbleRadius(props) {
+    const r = props.BubbleSize;
+    return typeof r === 'number' && isFinite(r) && r > 0 ? r : 10;
+}
+
+function bubbleTextStyle(props) {
+    return { fontSize: Math.max(7, Math.round(bubbleRadius(props) * 0.9)), fontWeight: 'bold', fill: '#FFFFFF' };
+}
+
 // ── HTF CANDLES ──────────────────────────────────────────────────────────────
 // 30m and 1H candles (previous + current only) drawn to the right of the last
 // bar, built from the chart's own bars, with the big trade bubbles of each HTF
@@ -247,76 +259,13 @@ function buildHtfCandle(bars) {
 // ── ABSORBED BIG ORDERS → CISD ───────────────────────────────────────────────
 // A big order is a bubble (same threshold and price grouping as the chart
 // bubbles). Big sellers are absorbed when no candle closes below their zone and
-// price then makes a bullish CISD: a close above the highest open of the latest
-// run of down-close candles, with the sellers' zone below that level. Big buyers
-// mirror it with a bearish CISD. Judged on closed candles only.
+// price then makes a bullish CISD: a close above the highest open of the down-
+// close candles that held those sellers (from the first of them to the end of
+// the run; the whole latest down run when the sellers sit outside it), with the
+// sellers' zone below that level. Big buyers mirror it with a bearish CISD.
 const ABSORB_COLORS = { bull: '#52D4FC', bear: '#FD7070' };
 // Colour of the candle that makes the CISD.
 const CISD_CANDLE_COLORS = { bull: '#22C55E', bear: '#EF4444' };
-
-// Copy of the absorption state, so the forming candle can be judged without
-// changing what the closed candles have built up.
-function cloneAbsState(st) {
-    return {
-        sell: st.sell.slice(),
-        buy: st.buy.slice(),
-        downRun: st.downRun ? Object.assign({}, st.downRun) : null,
-        upRun: st.upRun ? Object.assign({}, st.upRun) : null,
-        lastDir: st.lastDir,
-    };
-}
-
-// One closed candle: records its big orders, drops the ones price closed
-// through (they worked) or that are too old, and returns the CISDs that
-// absorbed big orders on the other side.
-function stepAbsorption(st, bar, threshold, modSize, tolerance, maxBars) {
-    const events = [];
-    const { i, o, c, groups } = bar;
-
-    groups.forEach(({ price, bidVol, askVol }) => {
-        const delta = askVol - bidVol;
-        if (delta < -threshold) st.sell.push({ bar: i, low: price, high: price + modSize, delta });
-        if (delta > threshold)  st.buy.push({ bar: i, low: price, high: price + modSize, delta });
-    });
-    st.sell = st.sell.filter(b => i - b.bar <= maxBars && c >= b.low - tolerance);
-    st.buy  = st.buy.filter(b => i - b.bar <= maxBars && c <= b.high + tolerance);
-
-    const dir = c > o ? 1 : c < o ? -1 : 0;
-
-    // Bullish CISD absorbing big sellers
-    if (dir === 1 && st.downRun && c > st.downRun.level) {
-        const level = st.downRun.level;
-        const absorbed = st.sell.filter(b => b.low < level);
-        if (absorbed.length > 0) {
-            events.push({ side: 'bull', bar: i, level, start: st.downRun.start, orders: absorbed });
-            st.sell = st.sell.filter(b => absorbed.indexOf(b) < 0);
-        }
-        st.downRun = null;
-    }
-    // Bearish CISD absorbing big buyers
-    if (dir === -1 && st.upRun && c < st.upRun.level) {
-        const level = st.upRun.level;
-        const absorbed = st.buy.filter(b => b.high > level);
-        if (absorbed.length > 0) {
-            events.push({ side: 'bear', bar: i, level, start: st.upRun.start, orders: absorbed });
-            st.buy = st.buy.filter(b => absorbed.indexOf(b) < 0);
-        }
-        st.upRun = null;
-    }
-
-    // Runs of same-direction candles (dojis skipped); the newest run is the reference.
-    if (dir === -1) {
-        if (st.lastDir === -1 && st.downRun) st.downRun.level = Math.max(st.downRun.level, o);
-        else st.downRun = { start: i, level: o };
-    }
-    if (dir === 1) {
-        if (st.lastDir === 1 && st.upRun) st.upRun.level = Math.min(st.upRun.level, o);
-        else st.upRun = { start: i, level: o };
-    }
-    if (dir !== 0) st.lastDir = dir;
-
-    return events;
-}
 
 // The zone of the absorbed orders around their average price: the average is
 // weighted by each order's size (|delta|), and every order whose middle lies
@@ -340,6 +289,91 @@ function absorbedZone(ev, modSize) {
     if (ev.side === 'bull') zone.high = Math.min(zone.high, ev.level);
     else zone.low = Math.max(zone.low, ev.level);
     return zone;
+}
+
+// Copy of the absorption state, so the forming candle can be judged without
+// changing what the closed candles have built up.
+function cloneAbsState(st) {
+    return {
+        sell: st.sell.slice(),
+        buy: st.buy.slice(),
+        downRun: st.downRun ? Object.assign({}, st.downRun, { opens: st.downRun.opens.slice() }) : null,
+        upRun: st.upRun ? Object.assign({}, st.upRun, { opens: st.upRun.opens.slice() }) : null,
+        lastDir: st.lastDir,
+    };
+}
+
+// The level a candle has to close through to show the big orders were
+// absorbed: the extreme open (highest for a down run, lowest for an up run) of
+// the run's candles from the first one holding big orders that are still
+// standing. If none of those orders is inside the run, the whole run counts.
+function absorptionLevel(run, orders, pick) {
+    const inRun = orders.filter(b => b.bar >= run.start);
+    if (inRun.length === 0) return run.level;
+    const anchor = Math.min(...inRun.map(b => b.bar));
+    const opens = run.opens.filter(x => x.bar >= anchor).map(x => x.open);
+    return opens.length > 0 ? pick(...opens) : run.level;
+}
+
+// One closed candle: records its big orders, drops the ones price closed
+// through (they worked) or that are too old, and returns the CISDs that
+// absorbed big orders on the other side.
+function stepAbsorption(st, bar, threshold, modSize, tolerance, maxBars) {
+    const events = [];
+    const { i, o, c, groups } = bar;
+
+    groups.forEach(({ price, bidVol, askVol }) => {
+        const delta = askVol - bidVol;
+        if (delta < -threshold) st.sell.push({ bar: i, low: price, high: price + modSize, delta });
+        if (delta > threshold)  st.buy.push({ bar: i, low: price, high: price + modSize, delta });
+    });
+    st.sell = st.sell.filter(b => i - b.bar <= maxBars && c >= b.low - tolerance);
+    st.buy  = st.buy.filter(b => i - b.bar <= maxBars && c <= b.high + tolerance);
+
+    const dir = c > o ? 1 : c < o ? -1 : 0;
+
+    // Bullish CISD absorbing big sellers: a close above the down candles that
+    // held the sellers (or above the whole down run)
+    if (dir === 1 && st.downRun) {
+        const level = absorptionLevel(st.downRun, st.sell, Math.max);
+        if (c > level) {
+            const absorbed = st.sell.filter(b => b.low < level);
+            if (absorbed.length > 0) {
+                events.push({ side: 'bull', bar: i, level, start: st.downRun.start, orders: absorbed });
+                st.sell = st.sell.filter(b => absorbed.indexOf(b) < 0);
+            }
+            st.downRun = null;
+        }
+    }
+    // Bearish CISD absorbing big buyers
+    if (dir === -1 && st.upRun) {
+        const level = absorptionLevel(st.upRun, st.buy, Math.min);
+        if (c < level) {
+            const absorbed = st.buy.filter(b => b.high > level);
+            if (absorbed.length > 0) {
+                events.push({ side: 'bear', bar: i, level, start: st.upRun.start, orders: absorbed });
+                st.buy = st.buy.filter(b => absorbed.indexOf(b) < 0);
+            }
+            st.upRun = null;
+        }
+    }
+
+    // Runs of same-direction candles (dojis skipped); the newest run is the reference.
+    if (dir === -1) {
+        if (st.lastDir === -1 && st.downRun) {
+            st.downRun.level = Math.max(st.downRun.level, o);
+            st.downRun.opens.push({ bar: i, open: o });
+        } else st.downRun = { start: i, level: o, opens: [{ bar: i, open: o }] };
+    }
+    if (dir === 1) {
+        if (st.lastDir === 1 && st.upRun) {
+            st.upRun.level = Math.min(st.upRun.level, o);
+            st.upRun.opens.push({ bar: i, open: o });
+        } else st.upRun = { start: i, level: o, opens: [{ bar: i, open: o }] };
+    }
+    if (dir !== 0) st.lastDir = dir;
+
+    return events;
 }
 
 class BigTradeDeltaAbsorption {
@@ -477,7 +511,6 @@ class BigTradeDeltaAbsorption {
             Object.values(combinedProfs).forEach(({ bidVol, askVol, price }) => {
                 const delta    = -(bidVol - askVol);
                 const xOffset  = 0.02;
-                const fontSize = 9;
 
                 this.mdelta   = Math.abs(delta);
                 this.maxDelta = Math.max(this.mdelta, this.maxDelta);
@@ -487,22 +520,15 @@ class BigTradeDeltaAbsorption {
                     x: op(du(d.index()), '-', du(xOffset)),
                     y: du(price + modifiedSize / 2)
                 };
-
-                const minR   = 8;
-                const maxR   = this.props.MaxBubbleSize;
-                const maxI   = this.maxDelta + (this.maxDelta / 2.15);
                 const cValue = delta;
 
-                const radiusScale = Math.min(
-                    ((Math.abs(cValue) - volThreshold) / (maxI - volThreshold)) * (maxR - minR) + minR,
-                    maxR
-                );
-
+                // Every bubble has the same size, centred on the candle, so it
+                // stays inside the candle's width whatever its delta.
                 if (Math.abs(cValue) > volThreshold) {
                     volCircles.children.push({
                         tag: "Shapes",
                         key: `bar${d.index()}${price}`,
-                        primitives: [{ tag: 'Circle', radius: radiusScale, center: ctrPt }],
+                        primitives: [{ tag: 'Circle', radius: bubbleRadius(this.props), center: ctrPt }],
                         fillStyle: {
                             color: cValue > 0 ? this.props.positiveDeltaColor : this.props.negativeDeltaColor,
                             opacity: this.props.BubbleOpacity
@@ -513,7 +539,7 @@ class BigTradeDeltaAbsorption {
                         key: `${d.index()}${price}`,
                         text: this.props.EnableBubbleLabels ? `${cValue}` : undefined,
                         point: ctrPt,
-                        style: { fontSize, fill: '#ffffff' },
+                        style: bubbleTextStyle(this.props),
                         textAlignment: 'centerMiddle'
                     });
                 }
@@ -866,25 +892,17 @@ class BigTradeDeltaAbsorption {
                     lineStyle: { lineWidth: 1, color: colors.border }
                 });
 
-                // Bubbles: same threshold, sizing and colours as the chart bubbles,
-                // scaled against this timeframe's largest delta.
+                // Bubbles: same size, colours and text as the chart bubbles, with
+                // the HTF threshold.
                 if (this.props.EnableBubbles) {
-                    const minR = 8;
-                    const maxR = this.props.MaxBubbleSize;
-                    const maxD = this.htfMaxDelta[tf.key] || 0;
-                    const maxI = maxD + (maxD / 2.15);
                     candle.groups.forEach(({ bidVol, askVol, price }) => {
                         const cValue = -(bidVol - askVol);
                         if (Math.abs(cValue) <= volThreshold) return;
-                        const radiusScale = Math.min(
-                            ((Math.abs(cValue) - volThreshold) / (maxI - volThreshold)) * (maxR - minR) + minR,
-                            maxR
-                        );
                         const ctrPt = { x: du(cx), y: du(price + modifiedSize / 2) };
                         container.children.push({
                             tag: 'Shapes',
                             key: `htf_${tf.key}_${bucket}_b${price}`,
-                            primitives: [{ tag: 'Circle', radius: radiusScale, center: ctrPt }],
+                            primitives: [{ tag: 'Circle', radius: bubbleRadius(this.props), center: ctrPt }],
                             fillStyle: {
                                 color: cValue > 0 ? this.props.positiveDeltaColor : this.props.negativeDeltaColor,
                                 opacity: this.props.BubbleOpacity
@@ -895,7 +913,7 @@ class BigTradeDeltaAbsorption {
                             key: `htf_${tf.key}_${bucket}_t${price}`,
                             text: this.props.EnableBubbleLabels ? `${cValue}` : undefined,
                             point: ctrPt,
-                            style: { fontSize: 9, fill: '#ffffff' },
+                            style: bubbleTextStyle(this.props),
                             textAlignment: 'centerMiddle'
                         });
                     });
@@ -956,11 +974,11 @@ module.exports = {
         // ── BUBBLES ───────────────────────────────────────────────────────────
         divider1:           predef.paramSpecs.enum({ s: '━━━━━━━━━━  BIG TRADE BUBBLES  ━━━━━━━━━━' }, 's'),
         EnableBubbles:      predef.paramSpecs.bool(true),
-        positiveDeltaColor: predef.paramSpecs.color('#00CCB4'),
-        negativeDeltaColor: predef.paramSpecs.color('#9900CC'),
+        positiveDeltaColor: predef.paramSpecs.color('#1D4ED8'),
+        negativeDeltaColor: predef.paramSpecs.color('#EA580C'),
         RthVolThreshold:    predef.paramSpecs.number(155, 1, 0),
-        BubbleOpacity:      predef.paramSpecs.number(40,  1, 0),
-        MaxBubbleSize:      predef.paramSpecs.number(50, 1, 0),
+        BubbleOpacity:      predef.paramSpecs.number(90,  1, 0),
+        BubbleSize:         predef.paramSpecs.number(10, 1, 1),
         EnableBubbleLabels: predef.paramSpecs.bool(true),
         priceLevelsPerBar:  predef.paramSpecs.number(6,   1, 1),
 
