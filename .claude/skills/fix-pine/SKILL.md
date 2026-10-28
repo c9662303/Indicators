@@ -32,6 +32,11 @@ Common errors and their usual cause:
 | `The script must have at least one output` | An indicator with no plot. Add a `plot` (or `plot(na)` if it only draws objects) |
 | `Loop takes too long` / `Script execution timeout` | Too much work per bar. Cut loop length, cache results with `var`, or only compute on `barstate.islast` |
 | `Too many securities` | Too many `request.*` calls. Combine with tuples |
+| `The shorttitle is too long` (SHORT_TITLE_TOO_LONG) | `shorttitle` must be 10 characters or fewer, spaces included |
+| `The "x" argument is not used. The first method argument should be used` (CE10236) | Make it a plain function, or a method on the type it actually uses |
+
+After fixing a new kind of error, add it to this table and to the "Compiler checks that are easy to miss"
+section of the `pine-script` skill, so it is avoided next time.
 
 For **wrong behaviour** (it compiles, but the chart looks wrong):
 compare the code with `spec.md` first. Typical causes are repainting, an off-by-one in `[n]` references, `na` at the start of history,

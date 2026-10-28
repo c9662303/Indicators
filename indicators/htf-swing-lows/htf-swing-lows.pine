@@ -1,510 +1,1572 @@
 // ─────────────────────────────────────────────────────────────
-// HTF Swing Lows + CISD  v0.8.0
-// 1. Draws a line at the low of a higher-timeframe candle once the next HTF candle
-//    has swept below it (dashed while forming, solid once it closed back above).
-// 2. Draws the CISD on the chart timeframe that comes out of the HTF swing low price
-//    is currently leaving: the level where the current run of same-direction candles
-//    began, shown pending (dashed) and then solid once price closes through it,
-//    together with the HTF swing low it came out of.
-// Swing definition and the timeframe visibility matrix adapted from
-// "TLM HTF Candles" (Mozilla Public License 2.0). CISD logic re-implemented from
-// the "CISD by tncylyv" sample (licence not stated in the sample).
+// HTF Swing Points + CISD  v1.3.0
+// Swing point model: C1 / C2 / C3 swing points traded top-down.
+// 1. Context (Weekly / Daily / 4H), either:
+//    - a C2 forming or its C3 running, from a real low (C2 took C1's low) or an SMT low
+//      (a correlated index took its low, this one did not), or
+//    - continuation: the candle after an expansion candle (one that closed through the previous candle's
+//      extreme, e.g. a failure to manipulate a low), while setups hold the near half of that expansion candle.
+// 2. Setups: inside that context, 1H / 30m / 15m C2s.
+// 3. Entry: the first valid CISD per setup on the paired timeframe (1H -> 5m, 30m -> 3m, 15m -> 1m + 3m),
+//    then the propulsion block (the next pullback run closed through again).
+//    Valid = the run of down-close candles it closes above started inside the setup's C2 candle or later.
+// The analysis runs over the whole history, but by default only the current 4H candle's entries are drawn
+// (plus the context and setups that are still open).
+// Display: a sequence table (bias, live 4H candle, C2 quality checks, setup lanes, execution), a panel of 15m / 1H / 4H
+// candles right of price tagged C1-C4 with countdowns, the current 4H candle box, previous day levels and text tags.
+// Bearish is the same logic on mirrored prices. The logic runs on closed bars, so no signal repaints; only the candle
+// panel and the boxes follow the unclosed bar.
+// C1/C2/C3 idea adapted from "TLM HTF Candles" (Mozilla Public License 2.0). CISD logic re-implemented
+// from the "CISD by tncylyv" sample (licence not stated in the sample).
 // ─────────────────────────────────────────────────────────────
 //@version=6
-indicator("HTF Swing Lows + CISD", shorttitle = "HTF SL+CISD", overlay = true, max_lines_count = 500, max_labels_count = 500, max_bars_back = 500)
+indicator("HTF Swing Points + CISD", shorttitle = "Swing Pts", overlay = true, max_lines_count = 500, max_labels_count = 200,
+  max_boxes_count = 100)
 
 // ── Constants ────────────────────────────────────────────────
-GRP_HTF    = "Higher timeframes"
-GRP_VIS    = "Show on chart timeframe"
-GRP_SWEEP  = "Which sweeps"
-GRP_STYLE  = "Style"
-GRP_CISD   = "CISD (chart timeframe)"
-CISD_LOOKBACK = 500
+GRP_CTX   = "1 · Context (higher timeframe swing point)"
+GRP_INT   = "2 · Setups → 3 · CISD entry"
+GRP_SHOW  = "Show"
+GRP_TABLE = "Sequence table"
+GRP_PANEL = "Higher-timeframe candles (right of price)"
+GRP_CHART = "Chart context"
+GRP_COL   = "Colours"
+CISD_LOOKBACK = 300    // CISD candles scanned back for the run of same-direction candles
+CANDLE_CAP    = 400    // completed CISD candles kept per timeframe
+PANEL_CAP     = 10     // candles kept per panel timeframe
+TABLE_ROWS    = 24
+// Sequence table palette: dark on both chart themes.
+TBL_HDR  = #131722
+TBL_SEC  = #2A2E39
+TBL_ROW  = #1E222D
+TBL_TXT  = #D1D4DC
+TBL_DIM  = #787B86
+TBL_GOOD = #1B5E20
+TBL_BAD  = #8E1B1B
+TBL_WAIT = #7A5C00
+TBL_BLUE = #1848CC
+TXT_GOOD = #66BB6A
+TXT_BAD  = #EF5350
+TXT_WAIT = #FFB300
+TRANSPARENT = color.new(color.black, 100)
 
-// ── Inputs: higher timeframe slots ──────────────────────────
-show1Input = input.bool(true,  "HTF 1", group = GRP_HTF, inline = "h1")
-htf1Input  = input.timeframe("5",   "", group = GRP_HTF, inline = "h1")
-col1Input  = input.color(#C2185B, "",   group = GRP_HTF, inline = "h1")
+// ── Inputs: context ─────────────────────────────────────────
+ctxWInput  = input.bool(false, "Weekly", group = GRP_CTX, inline = "ctx")
+ctxDInput  = input.bool(true, "Daily", group = GRP_CTX, inline = "ctx")
+ctx4hInput = input.bool(true, "4H", group = GRP_CTX, inline = "ctx",
+  tooltip = "Setups only count while one of these is forming a C2 or is in the C3 after it, in the same direction.")
+smtInput = input.bool(true, "SMT lows count", group = GRP_CTX,
+  tooltip = "A candle that did not take the previous low still counts as a C2 when a correlated index took its own previous low in the same candle.")
+smtSym1Input = input.string("", "SMT symbols", group = GRP_CTX, inline = "smt",
+  tooltip = "Leave empty for automatic: NQ uses ES + YM, ES uses NQ + YM, YM uses NQ + ES (micros map to micros). Otherwise type a symbol such as CME_MINI:ES1!.")
+smtSym2Input = input.string("", "", group = GRP_CTX, inline = "smt")
+ctxSmtOnlyInput = input.bool(false, "Only SMT lows (extra filter)", group = GRP_CTX)
+contInput = input.bool(true, "Continuation after an expansion candle", group = GRP_CTX,
+  tooltip = "When a context candle closes through the previous candle's extreme (a bullish close above its high, or a bearish close below its low: a failure to manipulate that level), the next candle is a continuation context. Setups count there if their low holds the upper half of the expansion candle (bearish: their high stays in its lower half). The half line is drawn dotted.")
+fractalInput = input.bool(true, "Setup low must be the context C2's low (fractal)", group = GRP_CTX,
+  tooltip = "The setup's C2 low has to be the same price as the Weekly/Daily/4H C2's low, so the setup is what forms the higher-timeframe low. Continuation contexts use the half-line rule instead.")
 
-show2Input = input.bool(true,  "HTF 2", group = GRP_HTF, inline = "h2")
-htf2Input  = input.timeframe("15",  "", group = GRP_HTF, inline = "h2")
-col2Input  = input.color(#2962FF, "",   group = GRP_HTF, inline = "h2")
+// ── Inputs: setups and CISD pairing ─────────────────────────
+int1hInput = input.bool(true, "1H", group = GRP_INT, inline = "i1")
+p1h5Input  = input.bool(true, "CISD 5m", group = GRP_INT, inline = "i1")
+int30Input = input.bool(true, "30m", group = GRP_INT, inline = "i2")
+p30m3Input = input.bool(true, "CISD 3m", group = GRP_INT, inline = "i2")
+int15Input = input.bool(true, "15m", group = GRP_INT, inline = "i3")
+p15m1Input = input.bool(true, "CISD 1m", group = GRP_INT, inline = "i3")
+p15m3Input = input.bool(true, "3m", group = GRP_INT, inline = "i3")
+waitInput  = input.int(0, "Extra candles after C3", minval = 0, maxval = 5, group = GRP_INT,
+  tooltip = "A setup accepts a CISD during its C2 and C3. This adds more candles of its own timeframe after C3.")
 
-show3Input = input.bool(true,  "HTF 3", group = GRP_HTF, inline = "h3")
-htf3Input  = input.timeframe("30",  "", group = GRP_HTF, inline = "h3")
-col3Input  = input.color(#00897B, "",   group = GRP_HTF, inline = "h3")
+// ── Inputs: show ────────────────────────────────────────────
+only4hInput   = input.bool(true, "Only the current 4H candle", group = GRP_SHOW,
+  tooltip = "Draw only the entries (setup lines, CISD, propulsion) of the 4H candle price is in now, plus the context and setups that are still open. Older drawings are removed when a new 4H candle starts. The analysis still uses the whole history.")
+bullInput     = input.bool(true, "Bullish (swing lows)", group = GRP_SHOW, inline = "dir")
+bearInput     = input.bool(true, "Bearish (swing highs)", group = GRP_SHOW, inline = "dir")
+showCtxInput  = input.bool(true, "Context swing lines (Weekly / Daily / 4H)", group = GRP_SHOW,
+  tooltip = "Also the dotted half line of an expansion candle. Hiding them does not change which setups or entries count.")
+showCisdInput = input.bool(true, "CISD entries", group = GRP_SHOW, inline = "cisd")
+propInput     = input.bool(true, "Propulsion block", group = GRP_SHOW,
+  tooltip = "After a setup's first CISD: the next pullback run of opposite candles that price closes through again. A second entry, drawn dotted in the CISD colour.")
+pendingInput  = input.bool(true, "Pending level", group = GRP_SHOW, inline = "cisd",
+  tooltip = "Pending level: the dashed CISD level a candle still has to close through while a setup is open. It moves with the market until it triggers.")
+keptInput     = input.int(20, "Swings kept per timeframe", minval = 1, maxval = 50, group = GRP_SHOW,
+  tooltip = "Per timeframe and direction. TradingView allows 500 lines in total; past that the oldest disappear.")
+cisdKeptInput = input.int(30, "CISD kept per timeframe", minval = 1, maxval = 60, group = GRP_SHOW,
+  tooltip = "Per CISD timeframe and direction. The oldest are deleted first.")
+overshootInput = input.int(2, "Swing line overshoot (bars)", minval = 0, maxval = 50, group = GRP_SHOW,
+  tooltip = "Chart bars a swing line keeps running after the candle that swept the low.")
+extendInput   = input.int(0, "CISD line extend (bars)", minval = 0, maxval = 50, group = GRP_SHOW,
+  tooltip = "Chart bars a CISD line runs past the candle that closed through it.")
 
-show4Input = input.bool(true,  "HTF 4", group = GRP_HTF, inline = "h4")
-htf4Input  = input.timeframe("60",  "", group = GRP_HTF, inline = "h4")
-col4Input  = input.color(#F57C00, "",   group = GRP_HTF, inline = "h4")
+// ── Inputs: sequence table ──────────────────────────────────
+statusInput    = input.bool(true, "Sequence table", group = GRP_TABLE, inline = "tbl")
+tablePosInput  = input.string("Middle right", "", options = ["Top right", "Middle right", "Bottom right", "Top left", "Bottom left"],
+  group = GRP_TABLE, inline = "tbl")
+tableSizeInput = input.string("Small", "", options = ["Tiny", "Small", "Normal"], group = GRP_TABLE, inline = "tbl")
+seqInput  = input.string("4H", "Sequence timeframe", options = ["4H", "Daily"], group = GRP_TABLE,
+  tooltip = "The swing point whose live candle (C2, C3, C4) the table follows and whose C2 it grades. That timeframe must be on under Context.")
+sideInput = input.string("Auto", "Direction", options = ["Auto", "Bullish", "Bearish"], group = GRP_TABLE,
+  tooltip = "Auto: the side whose sequence is further along (C3 > C2 or continuation > C4), plus a point each for the higher timeframe in line and an entry in the current 4H candle. Also sets the C1-C4 tags in the candle panel.")
+tzInput   = input.string("America/New_York", "Time zone for times", group = GRP_TABLE,
+  tooltip = "Used for every time in the table and the candle panel. An IANA name such as America/New_York, or an offset such as UTC-5.")
 
-show5Input = input.bool(true,  "HTF 5", group = GRP_HTF, inline = "h5")
-htf5Input  = input.timeframe("240", "", group = GRP_HTF, inline = "h5")
-col5Input  = input.color(#D32F2F, "",   group = GRP_HTF, inline = "h5")
+// ── Inputs: candle panel ────────────────────────────────────
+panelInput   = input.bool(true, "Show", group = GRP_PANEL, inline = "pn")
+pCountInput  = input.int(4, "Candles", minval = 2, maxval = 6, group = GRP_PANEL, inline = "pn")
+pTf1Input    = input.timeframe("15", "Timeframes", group = GRP_PANEL, inline = "ptf")
+pTf2Input    = input.timeframe("60", "", group = GRP_PANEL, inline = "ptf")
+pTf3Input    = input.timeframe("240", "", group = GRP_PANEL, inline = "ptf",
+  tooltip = "Timeframes above the chart's are drawn. Each candle shows its open time; C1-C4 mark the newest swing point in the table's direction.")
+pOffsetInput = input.int(10, "Distance from price (bars)", minval = 2, maxval = 200, group = GRP_PANEL)
+pWidthInput  = input.int(2, "Candle width (bars)", minval = 1, maxval = 6, group = GRP_PANEL)
+pUpInput     = input.color(#B2B5BE, "Up", group = GRP_PANEL, inline = "pc")
+pDownInput   = input.color(#5D606B, "Down", group = GRP_PANEL, inline = "pc")
+pWickInput   = input.color(#787B86, "Wick", group = GRP_PANEL, inline = "pc")
 
-show6Input = input.bool(false, "HTF 6", group = GRP_HTF, inline = "h6")
-htf6Input  = input.timeframe("1D",  "", group = GRP_HTF, inline = "h6")
-col6Input  = input.color(#7B1FA2, "",   group = GRP_HTF, inline = "h6")
+// ── Inputs: chart context ───────────────────────────────────
+box4hInput    = input.bool(true, "Current 4H candle box", group = GRP_CHART, inline = "bx")
+colC2BoxInput = input.color(color.new(#787B86, 85), "C2", group = GRP_CHART, inline = "bx")
+colC3BoxInput = input.color(color.new(#2962FF, 88), "C3", group = GRP_CHART, inline = "bx",
+  tooltip = "Shades the 4H candle price is in, from its open to its close: grey while it is a C2, blue while it is a C3 (the C2 before it is then shaded grey too).")
+pdInput    = input.bool(true, "Previous day high / low / equilibrium", group = GRP_CHART, inline = "pd")
+colPdInput = input.color(#787B86, "", group = GRP_CHART, inline = "pd")
+tagsInput  = input.bool(true, "Text tags on this 4H candle's lines", group = GRP_CHART,
+  tooltip = "\"30m SMT YM\" at a swing line, \"3m CISD\" / \"3m PB\" (propulsion block) at an entry, \"3m level\" at a pending CISD. Off = no text on the price lines.")
 
-// ── Inputs: which HTFs show on which chart timeframe ────────
-// A row matches when the chart timeframe equals the row's timeframe. Its boxes 1-6 are the HTF slots above.
-// If the chart timeframe matches an enabled row, the row decides what shows (the HTF checkboxes above are ignored).
-// If no enabled row matches, the checkboxes above decide, and only HTFs higher than the chart timeframe are drawn.
-r1OnInput = input.bool(true, "Chart", group = GRP_VIS, inline = "r1", tooltip = "Tick the HTF numbers to draw on this chart timeframe. Numbers match HTF 1-6 above.")
-r1TfInput = input.timeframe("30S", "", group = GRP_VIS, inline = "r1")
-r1H1Input = input.bool(true,  "1", group = GRP_VIS, inline = "r1")
-r1H2Input = input.bool(true,  "2", group = GRP_VIS, inline = "r1")
-r1H3Input = input.bool(false, "3", group = GRP_VIS, inline = "r1")
-r1H4Input = input.bool(false, "4", group = GRP_VIS, inline = "r1")
-r1H5Input = input.bool(false, "5", group = GRP_VIS, inline = "r1")
-r1H6Input = input.bool(false, "6", group = GRP_VIS, inline = "r1")
-
-r2OnInput = input.bool(true, "Chart", group = GRP_VIS, inline = "r2")
-r2TfInput = input.timeframe("1", "", group = GRP_VIS, inline = "r2")
-r2H1Input = input.bool(false, "1", group = GRP_VIS, inline = "r2")
-r2H2Input = input.bool(true,  "2", group = GRP_VIS, inline = "r2")
-r2H3Input = input.bool(true,  "3", group = GRP_VIS, inline = "r2")
-r2H4Input = input.bool(false, "4", group = GRP_VIS, inline = "r2")
-r2H5Input = input.bool(false, "5", group = GRP_VIS, inline = "r2")
-r2H6Input = input.bool(false, "6", group = GRP_VIS, inline = "r2")
-
-r3OnInput = input.bool(true, "Chart", group = GRP_VIS, inline = "r3")
-r3TfInput = input.timeframe("3", "", group = GRP_VIS, inline = "r3")
-r3H1Input = input.bool(false, "1", group = GRP_VIS, inline = "r3")
-r3H2Input = input.bool(true,  "2", group = GRP_VIS, inline = "r3")
-r3H3Input = input.bool(true,  "3", group = GRP_VIS, inline = "r3")
-r3H4Input = input.bool(false, "4", group = GRP_VIS, inline = "r3")
-r3H5Input = input.bool(false, "5", group = GRP_VIS, inline = "r3")
-r3H6Input = input.bool(false, "6", group = GRP_VIS, inline = "r3")
-
-r4OnInput = input.bool(true, "Chart", group = GRP_VIS, inline = "r4")
-r4TfInput = input.timeframe("5", "", group = GRP_VIS, inline = "r4")
-r4H1Input = input.bool(false, "1", group = GRP_VIS, inline = "r4")
-r4H2Input = input.bool(false, "2", group = GRP_VIS, inline = "r4")
-r4H3Input = input.bool(false, "3", group = GRP_VIS, inline = "r4")
-r4H4Input = input.bool(true,  "4", group = GRP_VIS, inline = "r4")
-r4H5Input = input.bool(false, "5", group = GRP_VIS, inline = "r4")
-r4H6Input = input.bool(false, "6", group = GRP_VIS, inline = "r4")
-
-r5OnInput = input.bool(true, "Chart", group = GRP_VIS, inline = "r5")
-r5TfInput = input.timeframe("15", "", group = GRP_VIS, inline = "r5")
-r5H1Input = input.bool(false, "1", group = GRP_VIS, inline = "r5")
-r5H2Input = input.bool(false, "2", group = GRP_VIS, inline = "r5")
-r5H3Input = input.bool(false, "3", group = GRP_VIS, inline = "r5")
-r5H4Input = input.bool(false, "4", group = GRP_VIS, inline = "r5")
-r5H5Input = input.bool(true,  "5", group = GRP_VIS, inline = "r5")
-r5H6Input = input.bool(false, "6", group = GRP_VIS, inline = "r5")
-
-r6OnInput = input.bool(true, "Chart", group = GRP_VIS, inline = "r6")
-r6TfInput = input.timeframe("30", "", group = GRP_VIS, inline = "r6")
-r6H1Input = input.bool(false, "1", group = GRP_VIS, inline = "r6")
-r6H2Input = input.bool(false, "2", group = GRP_VIS, inline = "r6")
-r6H3Input = input.bool(false, "3", group = GRP_VIS, inline = "r6")
-r6H4Input = input.bool(false, "4", group = GRP_VIS, inline = "r6")
-r6H5Input = input.bool(true,  "5", group = GRP_VIS, inline = "r6")
-r6H6Input = input.bool(false, "6", group = GRP_VIS, inline = "r6")
-
-r7OnInput = input.bool(true, "Chart", group = GRP_VIS, inline = "r7")
-r7TfInput = input.timeframe("60", "", group = GRP_VIS, inline = "r7")
-r7H1Input = input.bool(false, "1", group = GRP_VIS, inline = "r7")
-r7H2Input = input.bool(false, "2", group = GRP_VIS, inline = "r7")
-r7H3Input = input.bool(false, "3", group = GRP_VIS, inline = "r7")
-r7H4Input = input.bool(false, "4", group = GRP_VIS, inline = "r7")
-r7H5Input = input.bool(true,  "5", group = GRP_VIS, inline = "r7")
-r7H6Input = input.bool(false, "6", group = GRP_VIS, inline = "r7")
-
-// ── Inputs: which sweeps ────────────────────────────────────
-showConfirmedInput = input.bool(true, "Confirmed (swept, closed back above)", group = GRP_SWEEP,
-  tooltip = "The HTF candle after the swing took out the low and closed back above it. Solid line by default.")
-showPotentialInput = input.bool(true, "Potential (swept, candle still open)", group = GRP_SWEEP,
-  tooltip = "The current HTF candle has taken out the previous low but has not closed yet. Dashed line by default. Removed if the candle closes below the low.")
-
-// ── Inputs: style ───────────────────────────────────────────
-lineWidthInput      = input.int(1, "Line width", minval = 1, maxval = 5, group = GRP_STYLE)
-confirmedStyleInput = input.string("Solid", "Confirmed style", options = ["Solid", "Dashed", "Dotted"], group = GRP_STYLE)
-potentialStyleInput = input.string("Dashed", "Potential style", options = ["Solid", "Dashed", "Dotted"], group = GRP_STYLE)
-overshootInput      = input.int(2, "Overshoot (bars)", minval = 0, maxval = 50, group = GRP_STYLE,
-  tooltip = "How many chart bars the line extends past the end of the sweeping candle.")
-showLabelsInput     = input.bool(true, "Show timeframe labels", group = GRP_STYLE)
-maxKeptInput        = input.int(50, "Confirmed lines kept per timeframe", minval = 1, maxval = 100, group = GRP_STYLE,
-  tooltip = "Older confirmed lines are deleted, so lower this if the chart gets cluttered. TradingView allows 500 lines in total across the whole script; past that the oldest lines disappear.")
-showStatusInput     = input.bool(true, "Show status table", group = GRP_STYLE,
-  tooltip = "Bottom-right table: which settings row matched this chart, which HTFs are active, which swing low price is coming out of, and the CISD bias. Use it to check your timeframe settings.")
-
-// ── Inputs: CISD ────────────────────────────────────────────
-showCisdInput = input.bool(true, "Show CISD lines", group = GRP_CISD,
-  tooltip = "Works on the chart timeframe you are on. Bullish +CISD: price closed above the level while the bias was bearish. Bearish -CISD is the reverse.")
-cisdGateInput = input.bool(true, "Only CISD out of an HTF swing low", group = GRP_CISD,
-  tooltip = "On: a bullish CISD is drawn only while price is coming out of an HTF swing low that is shown on this chart (swept, and still inside the wait window below). All such timeframes are named in the label. Off: every CISD is drawn. Bearish CISDs need HTF swing highs, which are not tracked yet, so they are hidden while this is on.")
-cisdWaitInput = input.int(1, "HTF candles to wait after the sweep", minval = 0, maxval = 10, group = GRP_CISD,
-  tooltip = "How many HTF candles after the sweeping candle a CISD still counts as coming out of that swing. 0 = only during the sweeping candle itself. The swing stops counting early if the sweeping candle closes below the low. Every bullish CISD inside the window is drawn.")
-cisdPendingInput = input.bool(true, "Show pending CISD level", group = GRP_CISD,
-  tooltip = "While coming out of a swing low, shows the CISD level price still has to close above (dashed). It becomes the solid CISD line when it triggers.")
-cisdSwingRefInput = input.bool(true, "Show the swing low the CISD comes from", group = GRP_CISD,
-  tooltip = "Draws the swept 15m/30m/... low in its timeframe colour from where it was made up to the CISD, so you can see which low the CISD formed above. Drawn with every pending and triggered CISD, even if the swing lines above are turned off.")
-cisdFilterInput = input.string("Both", "Triggered CISD", options = ["Both", "Bullish Only", "Bearish Only"], group = GRP_CISD)
-cisdMaxInput = input.int(50, "Max CISD lines kept", minval = 1, maxval = 200, group = GRP_CISD,
-  tooltip = "Older CISD lines (and their labels) are deleted. TradingView allows 500 lines in total across the whole script.")
-cisdExtendInput = input.int(0, "Extend lines (bars)", minval = 0, maxval = 50, group = GRP_CISD,
-  tooltip = "0 = the line ends on the bar that triggered the CISD.")
-cisdStyleInput = input.string("Solid", "Line style", options = ["Solid", "Dashed", "Dotted"], group = GRP_CISD)
-cisdWidthInput = input.int(2, "Line width", minval = 1, maxval = 5, group = GRP_CISD)
-cisdBullInput = input.color(color.green, "Bullish colour", group = GRP_CISD, inline = "cisdcol")
-cisdBearInput = input.color(color.red, "Bearish colour", group = GRP_CISD, inline = "cisdcol")
-cisdLabelsInput = input.bool(true, "Show labels", group = GRP_CISD, inline = "cisdlbl")
-cisdLabelPosInput = input.string("Center", "", options = ["Left", "Center", "Right"], group = GRP_CISD, inline = "cisdlbl")
-cisdLabelSizeInput = input.string(size.small, "", options = [size.tiny, size.small, size.normal, size.large], group = GRP_CISD, inline = "cisdlbl")
+// ── Inputs: colours ─────────────────────────────────────────
+colWInput   = input.color(#455A64, "Weekly", group = GRP_COL, inline = "c1")
+colDInput   = input.color(#5D4037, "Daily", group = GRP_COL, inline = "c1")
+col4hInput  = input.color(#00838F, "4H", group = GRP_COL, inline = "c1")
+col1hInput  = input.color(#F57C00, "1H", group = GRP_COL, inline = "c2")
+col30Input  = input.color(#8E24AA, "30m", group = GRP_COL, inline = "c2")
+col15Input  = input.color(#2962FF, "15m", group = GRP_COL, inline = "c2")
+c1BullInput = input.color(#66bb6a, "CISD ▲ 1m", group = GRP_COL, inline = "c3")
+c3BullInput = input.color(#2e7d32, "3m", group = GRP_COL, inline = "c3")
+c5BullInput = input.color(#004d40, "5m", group = GRP_COL, inline = "c3")
+c1BearInput = input.color(#ef9a9a, "CISD ▼ 1m", group = GRP_COL, inline = "c4")
+c3BearInput = input.color(#e53935, "3m", group = GRP_COL, inline = "c4")
+c5BearInput = input.color(#b71c1c, "5m", group = GRP_COL, inline = "c4")
 
 // ── Types ────────────────────────────────────────────────────
-type SwingLow
-    line ln
-    label lb
-
-type CisdMark
-    line ln
-    label lb
-    array<line> swingLns    // the HTF swing lows this CISD came out of
-    array<label> swingLbs
-
-type HtfTracker
-    string name
+// A C2 on some timeframe. Prices are stored in "mirrored" space: for the bearish side every price is negated,
+// so one set of bullish rules handles both directions.
+type Setup
     int sec
+    bool isCtx = false
     color col
-    int armedFor = 0    // > 0 while we are coming out of a swept low; counts down per HTF candle
-    float armedLow      // the swept low we are coming out of
-    int armedLowBar     // bar where that low was made
+    int kind = 0          // 0 = real low taken, 1 = SMT low
+    string smtWith = ""   // which correlated index took its low (for the status table)
+    string smtHeld = ""   // real low: which correlated index did not take its own low (SMT the other way)
+    float low             // C1's low
+    int lowBar
+    int c1Time            // open times of C1 and C2
+    int c2Time
+    int c2Start
+    float c2Open
+    float c2Low
+    int c2LowBar
+    bool cisdInC2 = false // a 1m / 3m / 5m CISD in this direction while this (context) C2 was forming
+    int entryTime         // open time of the first CISD candle, its chart bar and timeframe
+    int entryBar
+    string entryTf = ""
+    int propTime          // open time of the propulsion block candle
+    int startBar
+    int endBar
+    bool isC3 = false
+    bool c3Settled = false
+    int typ = 0           // 1 = C2 closed back inside C1, 2 = closed below (C3 must close above C2's open)
+    bool failed = false
+    bool ctxOk = false
+    int left = 2          // candles left in the window (C2, C3, extra)
+    bool done1 = false    // first CISD already taken on 1m / 3m / 5m
+    bool done3 = false
+    bool done5 = false
+    bool prop1 = false    // propulsion block already taken on 1m / 3m / 5m
+    bool prop3 = false
+    bool prop5 = false
+    line ln
+
+// One timeframe, one direction.
+type Tracker
+    int sec
+    bool isCtx = false
+    color col
+    bool p1 = false       // pairs with the 1m / 3m / 5m CISD
+    bool p3 = false
+    bool p5 = false
     float prevLow
     int prevLowBar
+    float prevHigh
     float curLow
     int curLowBar
+    float curHigh
+    float curOpen
     float curClose
-    SwingLow active
-    array<SwingLow> kept
+    int curStart
+    int curTime           // open times of the current and previous candle
+    int prevTime
+    Setup lastC3          // the latest C2 whose C3 has closed, and the bar its C4 started
+    int lastC3At = -1
+    int contLeft = 0      // > 0 during the continuation candle after an expansion candle
+    float contMid         // half of the expansion candle
+    int contStart
+    array<line> contLines
+    float oth1Low         // correlated indices' current and previous candle lows on this timeframe
+    float oth1Prev
+    float oth2Low
+    float oth2Prev
+    Setup current         // C2 forming now
+    array<Setup> live     // C2s whose C3 (and extra candles) are still running
+    array<Setup> drawn
 
-// ── Which timeframes are active on this chart ───────────────
+// CISD on one paired timeframe, one direction, built from chart candles.
+type Machine
+    int sec
+    color col
+    int width
+    array<float> co
+    array<float> ch
+    array<float> cl
+    array<float> cc
+    array<int> cs         // first chart bar of each candle
+    array<int> ce         // last chart bar of each candle
+    bool hasCur = false
+    float curO
+    float curH
+    float curL
+    float curC
+    int curS
+    int curE
+    int curT              // open time of the forming candle
+    int bias = 0          // 1 up, -1 down, 0 not started
+    float level
+    int levelBar
+    float extreme
+    float pbLevel         // propulsion block: open of the latest pullback run after the CISD
+    int pbBar
+    bool pbArmed = false
+    array<line> marks
+    array<bool> markIsProp // per mark: true = propulsion block, false = CISD (index-aligned with marks)
+    line pending
+
+type Side
+    int d                 // 1 bullish, -1 bearish
+    array<Tracker> ctx
+    array<Tracker> inner
+    array<Machine> machines
+    string lastEntry = "" // latest entry, e.g. "3m CISD", for the alignment chain
+    int lastEntryBar = -1
+    int lastFvgBar = -1   // latest chart-timeframe fair value gap in this direction
+
+// Recent candles of one timeframe for the candle panel. The "v" arrays are the view: closed bars plus the unclosed one.
+type Panel
+    string tf
+    int sec
+    array<float> o
+    array<float> h
+    array<float> l
+    array<float> c
+    array<int> t
+    array<float> l1       // correlated indices' lows and highs per candle (SMT)
+    array<float> h1
+    array<float> l2
+    array<float> h2
+    array<float> vo
+    array<float> vh
+    array<float> vl
+    array<float> vc
+    array<int> vt
+    array<float> vl1
+    array<float> vh1
+    array<float> vl2
+    array<float> vh2
+
+// ── Timeframes available on this chart ──────────────────────
 chartSec = timeframe.in_seconds()
 
-rowMatch(bool on, string tf) =>
-    on and timeframe.in_seconds(tf) == chartSec
+canTf(int sec) =>
+    sec > chartSec
 
-on1 = rowMatch(r1OnInput, r1TfInput)
-on2 = rowMatch(r2OnInput, r2TfInput)
-on3 = rowMatch(r3OnInput, r3TfInput)
-on4 = rowMatch(r4OnInput, r4TfInput)
-on5 = rowMatch(r5OnInput, r5TfInput)
-on6 = rowMatch(r6OnInput, r6TfInput)
-on7 = rowMatch(r7OnInput, r7TfInput)
-anyRow = on1 or on2 or on3 or on4 or on5 or on6 or on7
+// A CISD timeframe has to be built from whole chart candles.
+canCisd(int sec) =>
+    sec >= chartSec and sec % chartSec == 0
 
-row1 = array.from(r1H1Input, r1H2Input, r1H3Input, r1H4Input, r1H5Input, r1H6Input)
-row2 = array.from(r2H1Input, r2H2Input, r2H3Input, r2H4Input, r2H5Input, r2H6Input)
-row3 = array.from(r3H1Input, r3H2Input, r3H3Input, r3H4Input, r3H5Input, r3H6Input)
-row4 = array.from(r4H1Input, r4H2Input, r4H3Input, r4H4Input, r4H5Input, r4H6Input)
-row5 = array.from(r5H1Input, r5H2Input, r5H3Input, r5H4Input, r5H5Input, r5H6Input)
-row6 = array.from(r6H1Input, r6H2Input, r6H3Input, r6H4Input, r6H5Input, r6H6Input)
-row7 = array.from(r7H1Input, r7H2Input, r7H3Input, r7H4Input, r7H5Input, r7H6Input)
+// Candle boundaries. Unused ones fall back to the chart timeframe so every call stays valid.
+newW  = timeframe.change(ctxWInput and canTf(604800) ? "1W" : timeframe.period)
+newD  = timeframe.change(ctxDInput and canTf(86400) ? "1D" : timeframe.period)
+new4h = timeframe.change(ctx4hInput and canTf(14400) ? "240" : timeframe.period)
+new1h = timeframe.change(int1hInput and canTf(3600) ? "60" : timeframe.period)
+new30 = timeframe.change(int30Input and canTf(1800) ? "30" : timeframe.period)
+new15 = timeframe.change(int15Input and canTf(900) ? "15" : timeframe.period)
+newC1 = timeframe.change(canCisd(60) ? "1" : timeframe.period)
+newC3 = timeframe.change(canCisd(180) ? "3" : timeframe.period)
+newC5 = timeframe.change(canCisd(300) ? "5" : timeframe.period)
+// Always tracked (independent of the context inputs): the current 4H candle and the trading day.
+new4hBar = timeframe.change(canTf(14400) ? "240" : timeframe.period)
+newDayBar = timeframe.change(canTf(86400) ? "1D" : timeframe.period)
+var int cur4hStart = 0
+var int prev4hStart = na
+var float cur4hHigh = na
+var float cur4hLow = na
+var float prev4hHigh = na
+var float prev4hLow = na
+if new4hBar and canTf(14400)
+    prev4hStart := cur4hStart
+    prev4hHigh := cur4hHigh
+    prev4hLow := cur4hLow
+    cur4hStart := bar_index
+    cur4hHigh := high
+    cur4hLow := low
+else
+    cur4hHigh := na(cur4hHigh) ? high : math.max(cur4hHigh, high)
+    cur4hLow := na(cur4hLow) ? low : math.min(cur4hLow, low)
 
-// k is the zero-based HTF slot. A matching row overrides the slot's own checkbox.
-slotWanted(int k, bool slotOn) =>
-    anyRow ? ((on1 and row1.get(k)) or (on2 and row2.get(k)) or (on3 and row3.get(k)) or (on4 and row4.get(k)) or (on5 and row5.get(k)) or (on6 and row6.get(k)) or (on7 and row7.get(k))) : slotOn
+// Previous day's high, low and equilibrium (premium above, discount below).
+var int dayStartBar = 0
+var float dayHigh = na
+var float dayLow = na
+var float pdHigh = na
+var float pdLow = na
+if newDayBar and canTf(86400)
+    pdHigh := dayHigh
+    pdLow := dayLow
+    dayStartBar := bar_index
+    dayHigh := high
+    dayLow := low
+else
+    dayHigh := na(dayHigh) ? high : math.max(dayHigh, high)
+    dayLow := na(dayLow) ? low : math.min(dayLow, low)
+pdEq = (pdHigh + pdLow) / 2
 
-// A slot is only drawn when its timeframe is higher than the chart timeframe.
-active1 = slotWanted(0, show1Input) and timeframe.in_seconds(htf1Input) > chartSec
-active2 = slotWanted(1, show2Input) and timeframe.in_seconds(htf2Input) > chartSec
-active3 = slotWanted(2, show3Input) and timeframe.in_seconds(htf3Input) > chartSec
-active4 = slotWanted(3, show4Input) and timeframe.in_seconds(htf4Input) > chartSec
-active5 = slotWanted(4, show5Input) and timeframe.in_seconds(htf5Input) > chartSec
-active6 = slotWanted(5, show6Input) and timeframe.in_seconds(htf6Input) > chartSec
+// Chart-timeframe fair value gaps (displacement).
+fvgUp = low > high[2]
+fvgDn = high < low[2]
 
-// HTF candle boundaries. An inactive slot falls back to the chart timeframe so the call is always valid.
-new1 = timeframe.change(active1 ? htf1Input : timeframe.period)
-new2 = timeframe.change(active2 ? htf2Input : timeframe.period)
-new3 = timeframe.change(active3 ? htf3Input : timeframe.period)
-new4 = timeframe.change(active4 ? htf4Input : timeframe.period)
-new5 = timeframe.change(active5 ? htf5Input : timeframe.period)
-new6 = timeframe.change(active6 ? htf6Input : timeframe.period)
+// Candle panel timeframes; ones not above the chart's fall back to the chart timeframe (and are not drawn).
+// Seconds, candle starts and close times come from the (simple) inputs here, so no series timeframe string reaches a built-in.
+pSec1 = timeframe.in_seconds(pTf1Input)
+pSec2 = timeframe.in_seconds(pTf2Input)
+pSec3 = timeframe.in_seconds(pTf3Input)
+pTfUse1 = pSec1 > chartSec ? pTf1Input : timeframe.period
+pTfUse2 = pSec2 > chartSec ? pTf2Input : timeframe.period
+pTfUse3 = pSec3 > chartSec ? pTf3Input : timeframe.period
+pNew1 = timeframe.change(pTfUse1)
+pNew2 = timeframe.change(pTfUse2)
+pNew3 = timeframe.change(pTfUse3)
+pClose1 = time_close(pTfUse1)
+pClose2 = time_close(pTfUse2)
+pClose3 = time_close(pTfUse3)
+
+newFor(int sec) =>
+    switch sec
+        604800 => newW
+        86400 => newD
+        14400 => new4h
+        3600  => new1h
+        1800  => new30
+        900   => new15
+        60    => newC1
+        180   => newC3
+        300   => newC5
+        => false
+
+// ── SMT: correlated indices on the chart timeframe ──────────
+string autoSym1 = switch syminfo.root
+    "NQ"  => "CME_MINI:ES1!"
+    "ES"  => "CME_MINI:NQ1!"
+    "YM"  => "CME_MINI:NQ1!"
+    "MNQ" => "CME_MINI:MES1!"
+    "MES" => "CME_MINI:MNQ1!"
+    "MYM" => "CME_MINI:MNQ1!"
+    => ""
+string autoSym2 = switch syminfo.root
+    "NQ"  => "CBOT_MINI:YM1!"
+    "ES"  => "CBOT_MINI:YM1!"
+    "YM"  => "CME_MINI:ES1!"
+    "MNQ" => "CBOT_MINI:MYM1!"
+    "MES" => "CBOT_MINI:MYM1!"
+    "MYM" => "CME_MINI:MES1!"
+    => ""
+sym1 = smtSym1Input != "" ? smtSym1Input : autoSym1
+sym2 = smtSym2Input != "" ? smtSym2Input : autoSym2
+smtOn = smtInput and (sym1 != "" or sym2 != "")
+
+// The correlated indices are always loaded for the strength ranking; SMT only uses them when "SMT lows count" is on.
+[o1Low, o1High, o1Open, o1Close] = request.security(sym1 != "" ? sym1 : syminfo.tickerid, timeframe.period, [low, high, open, close], ignore_invalid_symbol = true)
+[o2Low, o2High, o2Open, o2Close] = request.security(sym2 != "" ? sym2 : syminfo.tickerid, timeframe.period, [low, high, open, close], ignore_invalid_symbol = true)
+float a1Low  = smtOn and sym1 != "" ? o1Low : na
+float a1High = smtOn and sym1 != "" ? o1High : na
+float a2Low  = smtOn and sym2 != "" ? o2Low : na
+float a2High = smtOn and sym2 != "" ? o2High : na
+
+// "CME_MINI:ES1!" -> "ES"
+shortSym(string sym) =>
+    array<string> parts = str.split(sym, ":")
+    str.replace_all(parts.size() > 0 ? parts.last() : sym, "1!", "")
+
+ownName = syminfo.root
+name1 = shortSym(sym1)
+name2 = shortSym(sym2)
+
+// Strength: percentage move from the trading day's open (18:00 New York for CME futures).
+var float dayOpen0 = na
+var float dayOpen1 = na
+var float dayOpen2 = na
+if newDayBar
+    dayOpen0 := open
+    dayOpen1 := sym1 != "" ? o1Open : na
+    dayOpen2 := sym2 != "" ? o2Open : na
 
 // ── Helpers ──────────────────────────────────────────────────
-lineStyleOf(string s) =>
-    switch s
-        "Dashed" => line.style_dashed
-        "Dotted" => line.style_dotted
-        => line.style_solid
+minNa(float a, float b) =>
+    na(a) ? b : na(b) ? a : math.min(a, b)
 
-confirmedStyle = lineStyleOf(confirmedStyleInput)
-potentialStyle = lineStyleOf(potentialStyleInput)
+maxNa(float a, float b) =>
+    na(a) ? b : na(b) ? a : math.max(a, b)
+
+fmtTime(int t) =>
+    na(t) ? "–" : str.format_time(t, "HH:mm", tzInput)
 
 // "15" -> "15m", "240" -> "4H", "1D" -> "1D"
-tfLabel(string tf) =>
-    int sec = timeframe.in_seconds(tf)
-    string out = ""
-    if sec >= 2592000
-        out := str.tostring(math.round(sec / 2592000.0)) + "M"
-    else if sec >= 604800
-        out := str.tostring(math.round(sec / 604800.0)) + "W"
-    else if sec >= 86400
-        out := str.tostring(math.round(sec / 86400.0)) + "D"
-    else if sec >= 3600
-        out := str.tostring(math.round(sec / 3600.0)) + "H"
-    else if sec >= 60
-        out := str.tostring(math.round(sec / 60.0)) + "m"
-    else
-        out := str.tostring(sec) + "s"
-    out
+tfName(int sec) =>
+    sec >= 86400 ? str.tostring(math.round(sec / 86400.0)) + "D" : sec >= 3600 ? str.tostring(math.round(sec / 3600.0)) + "H" : sec >= 60 ? str.tostring(math.round(sec / 60.0)) + "m" : str.tostring(sec) + "s"
 
-method erase(SwingLow this) =>
-    line.delete(this.ln)
-    label.delete(this.lb)
+method isDone(Setup s, int sec) =>
+    sec == 60 ? s.done1 : sec == 180 ? s.done3 : s.done5
 
-// Creates the active swing line, or moves and restyles it if it already exists.
-method draw(HtfTracker this, int x1, float y, int x2, bool confirmed) =>
-    string style = confirmed ? confirmedStyle : potentialStyle
-    if na(this.active)
-        line ln = line.new(x1, y, x2, y, color = this.col, style = style, width = lineWidthInput)
-        label lb = showLabelsInput ? label.new(x2, y, this.name, color = color(na), style = label.style_label_left, textcolor = this.col, size = size.tiny) : na
-        this.active := SwingLow.new(ln, lb)
+method markDone(Setup s, int sec) =>
+    if sec == 60
+        s.done1 := true
+    else if sec == 180
+        s.done3 := true
     else
-        SwingLow s = this.active
-        line.set_xy1(s.ln, x1, y)
-        line.set_xy2(s.ln, x2, y)
-        line.set_style(s.ln, style)
-        if not na(s.lb)
-            label.set_xy(s.lb, x2, y)
+        s.done5 := true
     true
 
-// Called once per confirmed chart bar. Tracks the previous and the forming HTF candle (only their lows and close matter).
-method update(HtfTracker this, bool newHtf) =>
-    if newHtf or na(this.curLow)
-        // The previous HTF candle closed on bar_index - 1. Settle the line for the (earlier, previous) pair.
-        bool confirmed = not na(this.prevLow) and this.curLow < this.prevLow and this.curClose > this.prevLow
-        // Coming-out-of-swing window: one HTF candle used up. It ends at once if the candle swept the low and closed below it.
-        if this.armedFor > 0
-            bool failed = not na(this.prevLow) and this.curLow < this.prevLow and this.curClose <= this.prevLow
-            this.armedFor := failed ? 0 : this.armedFor - 1
-        if confirmed and showConfirmedInput
-            this.draw(this.prevLowBar, this.prevLow, bar_index - 1 + overshootInput, true)
-            this.kept.push(this.active)
-            if this.kept.size() > maxKeptInput
-                SwingLow oldest = this.kept.shift()
-                oldest.erase()
-        else if not na(this.active)
-            this.active.erase()
-        this.active := na
-        this.prevLow := this.curLow
-        this.prevLowBar := this.curLowBar
-        this.curLow := low
-        this.curLowBar := bar_index
-    else if low < this.curLow
-        this.curLow := low
-        this.curLowBar := bar_index
-    this.curClose := close
+method isPropDone(Setup s, int sec) =>
+    sec == 60 ? s.prop1 : sec == 180 ? s.prop3 : s.prop5
 
-    // Has the forming candle swept the previous candle's low?
-    bool swept = not na(this.prevLow) and this.curLow < this.prevLow
-    if swept
-        this.armedFor := 1 + cisdWaitInput
-        this.armedLow := this.prevLow
-        this.armedLowBar := this.prevLowBar
-    if showPotentialInput and swept
-        this.draw(this.prevLowBar, this.prevLow, bar_index + overshootInput, false)
-    else if not na(this.active)
-        this.active.erase()
-        this.active := na
+method markProp(Setup s, int sec) =>
+    if sec == 60
+        s.prop1 := true
+    else if sec == 180
+        s.prop3 := true
+    else
+        s.prop5 := true
     true
 
-// ── Trackers (one per higher timeframe slot) ─────────────────
-var HtfTracker t1 = HtfTracker.new(name = tfLabel(htf1Input), sec = timeframe.in_seconds(htf1Input), col = col1Input, kept = array.new<SwingLow>())
-var HtfTracker t2 = HtfTracker.new(name = tfLabel(htf2Input), sec = timeframe.in_seconds(htf2Input), col = col2Input, kept = array.new<SwingLow>())
-var HtfTracker t3 = HtfTracker.new(name = tfLabel(htf3Input), sec = timeframe.in_seconds(htf3Input), col = col3Input, kept = array.new<SwingLow>())
-var HtfTracker t4 = HtfTracker.new(name = tfLabel(htf4Input), sec = timeframe.in_seconds(htf4Input), col = col4Input, kept = array.new<SwingLow>())
-var HtfTracker t5 = HtfTracker.new(name = tfLabel(htf5Input), sec = timeframe.in_seconds(htf5Input), col = col5Input, kept = array.new<SwingLow>())
-var HtfTracker t6 = HtfTracker.new(name = tfLabel(htf6Input), sec = timeframe.in_seconds(htf6Input), col = col6Input, kept = array.new<SwingLow>())
+method pairs(Tracker t, int sec) =>
+    sec == 60 ? t.p1 : sec == 180 ? t.p3 : t.p5
 
-// ── Logic ────────────────────────────────────────────────────
-// Everything runs on closed chart bars only, so nothing repaints.
-if barstate.isconfirmed
-    if active1
-        t1.update(new1)
-    if active2
-        t2.update(new2)
-    if active3
-        t3.update(new3)
-    if active4
-        t4.update(new4)
-    if active5
-        t5.update(new5)
-    if active6
-        t6.update(new6)
+newTracker(int sec, bool isCtx, color col, bool p1, bool p3, bool p5) =>
+    Tracker.new(sec = sec, isCtx = isCtx, col = col, p1 = p1, p3 = p3, p5 = p5, live = array.new<Setup>(), drawn = array.new<Setup>(),
+      contLines = array.new<line>())
 
-// ═════════════════════════════════════════════════════════════
-// CISD (chart timeframe)
-// ═════════════════════════════════════════════════════════════
-// Idea: while the bias is bullish, the CISD level is the lowest open of the latest run of bullish candles
-// that made the newest high. A close below it is a bearish CISD, the bias flips, and a new level is taken
-// from the bearish run. The mirror image applies while the bias is bearish.
+newMachine(int sec, color col, int width) =>
+    Machine.new(sec = sec, col = col, width = width, co = array.new<float>(), ch = array.new<float>(), cl = array.new<float>(),
+      cc = array.new<float>(), cs = array.new<int>(), ce = array.new<int>(), marks = array.new<line>(), markIsProp = array.new<bool>())
 
-cisdLineStyle = lineStyleOf(cisdStyleInput)
+buildSide(int d) =>
+    Side sd = Side.new(d = d, ctx = array.new<Tracker>(), inner = array.new<Tracker>(), machines = array.new<Machine>())
+    if ctxWInput and canTf(604800)
+        sd.ctx.push(newTracker(604800, true, colWInput, false, false, false))
+    if ctxDInput and canTf(86400)
+        sd.ctx.push(newTracker(86400, true, colDInput, false, false, false))
+    if ctx4hInput and canTf(14400)
+        sd.ctx.push(newTracker(14400, true, col4hInput, false, false, false))
+    bool use1h = int1hInput and canTf(3600)
+    bool use30 = int30Input and canTf(1800)
+    bool use15 = int15Input and canTf(900)
+    if use1h
+        sd.inner.push(newTracker(3600, false, col1hInput, false, false, p1h5Input))
+    if use30
+        sd.inner.push(newTracker(1800, false, col30Input, false, p30m3Input, false))
+    if use15
+        sd.inner.push(newTracker(900, false, col15Input, p15m1Input, p15m3Input, false))
+    if use15 and p15m1Input and canCisd(60)
+        sd.machines.push(newMachine(60, d == 1 ? c1BullInput : c1BearInput, 1))
+    if ((use30 and p30m3Input) or (use15 and p15m3Input)) and canCisd(180)
+        sd.machines.push(newMachine(180, d == 1 ? c3BullInput : c3BearInput, 2))
+    if use1h and p1h5Input and canCisd(300)
+        sd.machines.push(newMachine(300, d == 1 ? c5BullInput : c5BearInput, 3))
+    sd
 
-var int cisdBias = 0          // 1 bullish, -1 bearish, 0 not started yet
-var float cisdLevel = na      // the active CISD price level
-var int cisdLevelBar = na     // bar where the level's open was printed (line starts here)
-var float cisdExtreme = na    // highest high (bias 1) or lowest low (bias -1) of the current leg
-var array<CisdMark> cisdMarks = array.new<CisdMark>()
-var CisdMark cisdPending = na                   // dashed line for the CISD that has not triggered yet
-var array<HtfTracker> trackers = array.from(t1, t2, t3, t4, t5, t6)
+// Highest other timeframe that already draws a line at this exact low (0 if none).
+higherOwner(array<Tracker> ts, Setup s) =>
+    int best = 0
+    for t in ts
+        if t.sec != s.sec
+            for x in t.drawn
+                if not na(x.ln) and x.lowBar == s.lowBar and x.low == s.low
+                    best := math.max(best, t.sec)
+    best
 
-candleDir(int i) =>
-    close[i] > open[i] ? 1 : close[i] < open[i] ? -1 : 0
+dropLower(array<Tracker> ts, Setup s) =>
+    for t in ts
+        if t.sec < s.sec
+            for x in t.drawn
+                if not na(x.ln) and x.lowBar == s.lowBar and x.low == s.low
+                    line.delete(x.ln)
+                    x.ln := na
+    true
 
-// Walks back over candles that point in the bias direction (dojis are skipped) and stops at the first
-// opposite candle. Returns the extreme open of that run (lowest for bias 1, highest for bias -1)
-// and the bar_index of the nearest bar that has that open.
-// includeCurrent = true: the current bar belongs to the run. false: only use the run before the current bar.
-scanRun(int bias, bool includeCurrent) =>
-    float extreme = includeCurrent ? open : na
+// ── Machine (CISD) helpers ───────────────────────────────────
+method dirAt(Machine m, int j) =>
+    float o = m.co.get(j)
+    float c = m.cc.get(j)
+    c > o ? 1 : c < o ? -1 : 0
+
+// Extreme open of the latest run of bias-direction candles (dojis skipped) and the first chart bar of that candle.
+method scanRun(Machine m, int j, int bias, bool includeCurrent) =>
+    float ext = includeCurrent ? m.co.get(j) : na
     int farthest = 0
     bool started = includeCurrent
-    for i = 1 to CISD_LOOKBACK
-        int dir = candleDir(i)
-        if dir == 0
-            continue
-        if dir == bias
-            started := true
-            farthest := i
-            extreme := na(extreme) ? open[i] : (bias == 1 ? math.min(extreme, open[i]) : math.max(extreme, open[i]))
-        else if started
-            break
-    if na(extreme)
-        extreme := open
+    int maxK = math.min(CISD_LOOKBACK, j)
+    if maxK >= 1
+        for k = 1 to maxK
+            int dk = m.dirAt(j - k)
+            if dk == 0
+                continue
+            if dk == bias
+                started := true
+                farthest := k
+                float op = m.co.get(j - k)
+                ext := na(ext) ? op : bias == 1 ? math.min(ext, op) : math.max(ext, op)
+            else if started
+                break
+    if na(ext)
+        ext := m.co.get(j)
     int shift = 0
-    for k = ((includeCurrent or farthest == 0) ? 0 : 1) to farthest
-        if open[k] == extreme
-            shift := k
-            break
-    [extreme, bar_index - shift]
+    int k0 = (includeCurrent or farthest == 0) ? 0 : 1
+    if farthest >= k0
+        for k = k0 to farthest
+            if m.co.get(j - k) == ext
+                shift := k
+                break
+    [ext, m.cs.get(j - shift)]
 
-method eraseMark(CisdMark this) =>
-    line.delete(this.ln)
-    label.delete(this.lb)
-    for l in this.swingLns
-        line.delete(l)
-    for l in this.swingLbs
-        label.delete(l)
-
-// Lines at every HTF swing low price is coming out of, each in its timeframe's colour, ending at x2.
-swingRefs(int x2) =>
-    array<line> lns = array.new<line>()
-    array<label> lbs = array.new<label>()
-    if cisdGateInput and cisdSwingRefInput
-        for tr in trackers
-            if tr.armedFor > 0
-                lns.push(line.new(tr.armedLowBar, tr.armedLow, x2, tr.armedLow, color = tr.col, width = lineWidthInput, style = line.style_solid))
-                if cisdLabelsInput
-                    lbs.push(label.new(x2, tr.armedLow, tr.name + " low", color = color(na), style = label.style_label_left, textcolor = tr.col, size = size.tiny))
-    [lns, lbs]
-
-drawCisd(bool bullish, int x1, float y, string txt) =>
-    color col = bullish ? cisdBullInput : cisdBearInput
-    int x2 = bar_index + cisdExtendInput
-    line ln = line.new(x1, y, x2, y, color = col, width = cisdWidthInput, style = cisdLineStyle)
-    label lb = na
-    if cisdLabelsInput
-        int lx = cisdLabelPosInput == "Left" ? x1 : cisdLabelPosInput == "Right" ? x2 : math.round((x1 + x2) / 2.0)
-        lb := label.new(lx, y, txt, color = color(na), textcolor = col, style = bullish ? label.style_label_down : label.style_label_up, size = cisdLabelSizeInput)
-    [refLns, refLbs] = swingRefs(x2)
-    cisdMarks.push(CisdMark.new(ln, lb, refLns, refLbs))
-    if cisdMarks.size() > cisdMaxInput
-        CisdMark oldest = cisdMarks.shift()
-        oldest.eraseMark()
+// ── Side: swing points, context, setups ─────────────────────
+// One line per swept low; when several timeframes share it, the highest one draws it.
+method syncLine(Side sd, Setup s) =>
+    bool visible = not s.failed and (s.isCtx ? showCtxInput : s.ctxOk)
+    if not visible
+        if not na(s.ln)
+            line.delete(s.ln)
+            s.ln := na
+    else
+        string st = s.kind == 1 ? line.style_dotted : s.typ == 2 ? line.style_dashed : line.style_solid
+        float y = sd.d * s.low
+        if na(s.ln)
+            int owner = math.max(higherOwner(sd.ctx, s), higherOwner(sd.inner, s))
+            if owner < s.sec
+                dropLower(sd.ctx, s)
+                dropLower(sd.inner, s)
+                // xloc.bar_index cannot point more than 10000 bars back (only reachable on seconds charts).
+                int x1 = math.max(s.lowBar, bar_index - 9999)
+                s.ln := line.new(x1, y, s.endBar, y, color = s.col, width = s.isCtx ? 2 : 1, style = st)
+        else
+            line.set_x2(s.ln, s.endBar)
+            line.set_style(s.ln, st)
     true
 
-// Runs on closed bars only, like the swing logic above, so nothing repaints.
-if barstate.isconfirmed and showCisdInput
-    int dir0 = candleDir(0)
+// Can this context setup open entries? (With "Only SMT lows" on, real lows don't count.)
+method ctxUsable(Setup s) =>
+    not s.failed and (not ctxSmtOnlyInput or s.kind == 1)
 
-    // Which HTF swing lows are we coming out of? Names in slot order, e.g. "5m 15m".
-    string swingNames = ""
-    for tr in trackers
-        if tr.armedFor > 0
-            swingNames += (swingNames == "" ? "" : " ") + tr.name
-    bool outOfSwingLow = swingNames != ""
+method ctxActive(Side sd) =>
+    bool act = false
+    for t in sd.ctx
+        if not na(t.current) and t.current.ctxUsable()
+            act := true
+        for s in t.live
+            if s.ctxUsable()
+                act := true
+        if t.contLeft > 0
+            act := true
+    act
 
-    // Start: the first usable candle direction decides the initial bias.
-    if cisdBias == 0 and bar_index > 10
-        int first = dir0
+// Does this setup sit inside an active context?
+// C2 context: with "fractal" on, the setup's C2 low must be the context C2's low.
+// Continuation context: the setup formed after the expansion candle closed and its low holds that candle's near half.
+method fitsContext(Side sd, Setup s) =>
+    bool hit = false
+    for t in sd.ctx
+        if not na(t.current) and t.current.ctxUsable() and (not fractalInput or t.current.c2Low == s.c2Low)
+            hit := true
+        for c in t.live
+            if c.ctxUsable() and (not fractalInput or c.c2Low == s.c2Low)
+                hit := true
+        if t.contLeft > 0 and s.startBar >= t.contStart and s.c2Low >= t.contMid
+            hit := true
+    hit
+
+method markCtx(Side sd, Setup s) =>
+    if not s.ctxOk and not s.failed and sd.fitsContext(s)
+        s.ctxOk := true
+        sd.syncLine(s)
+    true
+
+method setupOk(Side sd, Setup s, Machine m, int endBar, int levelStart) =>
+    not s.failed and s.ctxOk and s.startBar <= endBar and levelStart >= s.c2Start and not s.isDone(m.sec) and
+      sd.fitsContext(s)
+
+// Setups this CISD can confirm.
+method setupsFor(Side sd, Machine m, int endBar, int levelStart) =>
+    array<Setup> out = array.new<Setup>()
+    for t in sd.inner
+        if t.pairs(m.sec)
+            if not na(t.current) and sd.setupOk(t.current, m, endBar, levelStart)
+                out.push(t.current)
+            for s in t.live
+                if sd.setupOk(s, m, endBar, levelStart)
+                    out.push(s)
+    out
+
+// Setups whose first CISD on this timeframe is in and whose propulsion block is still open.
+method propOk(Side sd, Setup s, Machine m, int endBar) =>
+    not s.failed and s.ctxOk and s.isDone(m.sec) and not s.isPropDone(m.sec) and s.startBar <= endBar and sd.fitsContext(s)
+
+method propSetups(Side sd, Machine m, int endBar) =>
+    array<Setup> out = array.new<Setup>()
+    for t in sd.inner
+        if t.pairs(m.sec)
+            if not na(t.current) and sd.propOk(t.current, m, endBar)
+                out.push(t.current)
+            for s in t.live
+                if sd.propOk(s, m, endBar)
+                    out.push(s)
+    out
+
+// A CISD candle closed: run the CISD state machine on it.
+method completeCandle(Side sd, Machine m) =>
+    m.co.push(m.curO)
+    m.ch.push(m.curH)
+    m.cl.push(m.curL)
+    m.cc.push(m.curC)
+    m.cs.push(m.curS)
+    m.ce.push(m.curE)
+    if m.co.size() > CANDLE_CAP
+        m.co.shift()
+        m.ch.shift()
+        m.cl.shift()
+        m.cc.shift()
+        m.cs.shift()
+        m.ce.shift()
+    m.hasCur := false
+    int j = m.co.size() - 1
+    float bh = m.ch.get(j)
+    float bl = m.cl.get(j)
+    float bc = m.cc.get(j)
+    int bEnd = m.ce.get(j)
+    int d0 = m.dirAt(j)
+
+    if m.bias == 0 and j > 10
+        int first = d0
         if first == 0
-            for k = 1 to 50
-                first := candleDir(k)
+            for k = 1 to math.min(50, j)    // same 50-candle search as engine.js
+                first := m.dirAt(j - k)
                 if first != 0
                     break
         if first != 0
-            cisdBias := first
-            [startLevel, startBar] = scanRun(first, true)
-            cisdLevel := startLevel
-            cisdLevelBar := startBar
-            cisdExtreme := first == 1 ? high : low
+            m.bias := first
+            [lv, lb] = m.scanRun(j, first, true)
+            m.level := lv
+            m.levelBar := lb
+            m.extreme := first == 1 ? bh : bl
 
-    if cisdBias != 0
-        // A new extreme in the bias direction moves the level to the latest run of bias-direction candles.
-        bool newExtreme = cisdBias == 1 ? high > cisdExtreme : low < cisdExtreme
-        if newExtreme
-            cisdExtreme := cisdBias == 1 ? high : low
-            [moveLevel, moveBar] = scanRun(cisdBias, dir0 == cisdBias)
-            cisdLevel := moveLevel
-            cisdLevelBar := moveBar
+    if m.bias != 0
+        if (m.bias == 1 ? bh > m.extreme : bl < m.extreme)
+            m.extreme := m.bias == 1 ? bh : bl
+            [lv2, lb2] = m.scanRun(j, m.bias, d0 == m.bias)
+            m.level := lv2
+            m.levelBar := lb2
 
-        // A close through the level against the bias is a CISD.
-        bool bullTrigger = cisdBias == -1 and close > cisdLevel
-        bool bearTrigger = cisdBias == 1 and close < cisdLevel
-        if bullTrigger or bearTrigger
-            // With the gate on, only a bullish CISD out of an HTF swing low counts (swing highs are not tracked yet).
-            bool allowed = not cisdGateInput or (bullTrigger and outOfSwingLow)
-            bool wanted = allowed and (cisdFilterInput == "Both" or (cisdFilterInput == "Bullish Only" and bullTrigger) or (cisdFilterInput == "Bearish Only" and bearTrigger))
-            if wanted
-                string txt = (bullTrigger ? "+CISD" : "-CISD") + (cisdGateInput ? " " + swingNames : "")
-                drawCisd(bullTrigger, cisdLevelBar, cisdLevel, txt)
-            cisdBias := bullTrigger ? 1 : -1
-            [flipLevel, flipBar] = scanRun(cisdBias, true)
-            cisdLevel := flipLevel
-            cisdLevelBar := flipBar
-            cisdExtreme := cisdBias == 1 ? high : low
+        bool up = m.bias == -1 and bc > m.level
+        bool down = m.bias == 1 and bc < m.level
+        if up or down
+            if up
+                // Any CISD in this direction while a context C2 forms counts for that C2's quality check.
+                for t in sd.ctx
+                    if not na(t.current)
+                        Setup formingCtx = t.current
+                        formingCtx.cisdInC2 := true
+                array<Setup> setups = sd.setupsFor(m, bEnd, m.levelBar)
+                if setups.size() > 0
+                    float y = sd.d * m.level
+                    m.marks.push(line.new(m.levelBar, y, bEnd + extendInput, y, color = m.col, width = m.width))
+                    m.markIsProp.push(false)
+                    if m.marks.size() > cisdKeptInput
+                        line.delete(m.marks.shift())
+                        m.markIsProp.shift()
+                    sd.lastEntry := tfName(m.sec) + " CISD"
+                    sd.lastEntryBar := bEnd
+                    // First CISD per setup per timeframe: the setup's line runs to it.
+                    for s in setups
+                        s.markDone(m.sec)
+                        if na(s.entryTime)
+                            s.entryTime := m.curT
+                            s.entryBar := bEnd
+                            s.entryTf := tfName(m.sec)
+                        s.endBar := math.max(s.endBar, bEnd)
+                        sd.syncLine(s)
+            m.bias := up ? 1 : -1
+            [lv3, lb3] = m.scanRun(j, m.bias, true)
+            m.level := lv3
+            m.levelBar := lb3
+            m.extreme := m.bias == 1 ? bh : bl
+            m.pbArmed := false
+        else if propInput and m.bias == 1
+            // Propulsion block: after the CISD, a pullback run of opposite candles that price closes through again.
+            if d0 == -1
+                [pl, pb] = m.scanRun(j, -1, true)
+                m.pbLevel := pl
+                m.pbBar := pb
+                m.pbArmed := true
+            else if m.pbArmed and d0 == 1 and bc > m.pbLevel
+                m.pbArmed := false
+                array<Setup> props = sd.propSetups(m, bEnd)
+                if props.size() > 0
+                    float py = sd.d * m.pbLevel
+                    m.marks.push(line.new(m.pbBar, py, bEnd + extendInput, py, color = m.col, width = m.width, style = line.style_dotted))
+                    m.markIsProp.push(true)
+                    if m.marks.size() > cisdKeptInput
+                        line.delete(m.marks.shift())
+                        m.markIsProp.shift()
+                    sd.lastEntry := tfName(m.sec) + " CISD + propulsion"
+                    sd.lastEntryBar := bEnd
+                    for s in props
+                        s.markProp(m.sec)
+                        if na(s.propTime)
+                            s.propTime := m.curT
+                        s.endBar := math.max(s.endBar, bEnd)
+                        sd.syncLine(s)
+    true
 
-    // Pending CISD: the level price must still close above to confirm the move out of the swing low.
-    // Redrawn on every closed bar, together with the swing lows it is coming out of.
-    if not na(cisdPending)
-        cisdPending.eraseMark()
-        cisdPending := na
-    bool showPending = cisdGateInput and cisdPendingInput and cisdBias == -1 and outOfSwingLow and cisdFilterInput != "Bearish Only"
-    if showPending
-        int px2 = bar_index + cisdExtendInput
-        line pln = line.new(cisdLevelBar, cisdLevel, px2, cisdLevel, color = cisdBullInput, width = cisdWidthInput, style = line.style_dashed)
-        label plb = cisdLabelsInput ? label.new(px2, cisdLevel, "+CISD " + swingNames + " (pending)", color = color(na), textcolor = cisdBullInput, style = label.style_label_left, size = cisdLabelSizeInput) : na
-        [refLns, refLbs] = swingRefs(px2)
-        cisdPending := CisdMark.new(pln, plb, refLns, refLbs)
+// The timeframe's candle that just closed (on bar_index - 1): settle C3s, then turn the C2 into a C3.
+method closeCandle(Side sd, Tracker t) =>
+    // Continuation: the candle that just closed above the previous candle's high is an expansion candle
+    // (bearish side: closed below the previous low, a failure to manipulate it). The next candle is the window.
+    if t.contLeft > 0
+        t.contLeft -= 1
+    if t.isCtx and contInput and not na(t.prevHigh) and t.curClose > t.prevHigh
+        t.contLeft := 1
+        t.contMid := (t.curHigh + t.curLow) / 2
+        t.contStart := bar_index
+        // The window counts as context either way; only the half line follows "Context swing lines" (as in engine.js).
+        if showCtxInput
+            float my = sd.d * t.contMid
+            t.contLines.push(line.new(math.max(t.curStart, bar_index - 9999), my, bar_index, my, color = color.new(t.col, 30), width = 1, style = line.style_dotted))
+            if t.contLines.size() > math.min(keptInput, 10)
+                line.delete(t.contLines.shift())
+    array<Setup> keep = array.new<Setup>()
+    for s in t.live
+        if not s.c3Settled
+            s.c3Settled := true
+            s.endBar := math.max(s.endBar, bar_index - 1)
+            if s.typ == 2 and not (t.curClose > s.c2Open)
+                s.failed := true
+            sd.syncLine(s)
+            t.lastC3 := s
+            t.lastC3At := bar_index    // the C4 candle starts on this bar
+        s.left -= 1
+        if s.left > 0 and not s.failed
+            keep.push(s)
+    t.live := keep
+    if not na(t.current)
+        Setup c2 = t.current
+        c2.isC3 := true
+        c2.left -= 1
+        c2.typ := c2.kind == 1 or t.curClose > c2.low ? 1 : 2
+        c2.endBar := math.max(c2.endBar, bar_index - 1 + overshootInput)
+        sd.syncLine(c2)
+        t.live.push(c2)
+        t.current := na
+    true
 
-// ── Status table ─────────────────────────────────────────────
-var table statusTable = table.new(position.bottom_right, 2, 5, bgcolor = color.new(color.gray, 85), border_width = 1)
+method updateTracker(Side sd, Tracker t, bool isNew, float o_, float h_, float l_, float c_, float a1, float a2) =>
+    if isNew or na(t.curLow)
+        if not na(t.curLow)
+            sd.closeCandle(t)
+        t.prevLow := t.curLow
+        t.prevLowBar := t.curLowBar
+        t.prevHigh := t.curHigh
+        t.curLow := l_
+        t.curLowBar := bar_index
+        t.curHigh := h_
+        t.curOpen := o_
+        t.curStart := bar_index
+        t.prevTime := t.curTime
+        t.curTime := time
+        t.oth1Prev := t.oth1Low
+        t.oth1Low := a1
+        t.oth2Prev := t.oth2Low
+        t.oth2Low := a2
+    else
+        if l_ < t.curLow
+            t.curLow := l_
+            t.curLowBar := bar_index
+        t.curHigh := math.max(t.curHigh, h_)
+        t.oth1Low := minNa(t.oth1Low, a1)
+        t.oth2Low := minNa(t.oth2Low, a2)
+    t.curClose := c_
+    if t.contLeft > 0 and t.contLines.size() > 0
+        line.set_x2(t.contLines.last(), bar_index)    // the half line runs through the continuation candle
+    if not na(t.current)
+        Setup forming = t.current    // assign through a local reference, not t.current.field := ...
+        forming.c2Low := t.curLow
+        forming.c2LowBar := t.curLowBar
+    for s in t.live
+        if not s.c3Settled
+            s.endBar := math.max(s.endBar, bar_index)    // the line runs through C3
+            sd.syncLine(s)
 
-statusRow(int r, string key, string value) =>
-    table.cell(statusTable, 0, r, key, text_color = chart.fg_color, text_size = size.small, text_halign = text.align_left)
-    table.cell(statusTable, 1, r, value, text_color = chart.fg_color, text_size = size.small, text_halign = text.align_left)
+    if not na(t.prevLow)
+        bool real = t.curLow < t.prevLow
+        bool sw1 = not na(t.oth1Prev) and t.oth1Low < t.oth1Prev
+        bool sw2 = not na(t.oth2Prev) and t.oth2Low < t.oth2Prev
+        bool smt = not real and smtOn and (sw1 or sw2)
+        string smtNames = sw1 and sw2 ? name1 + "+" + name2 : sw1 ? name1 : sw2 ? name2 : ""
+        // This index took its low but a correlated one did not take its own: SMT the other way round.
+        bool held1 = not na(t.oth1Prev) and not na(t.oth1Low) and not sw1
+        bool held2 = not na(t.oth2Prev) and not na(t.oth2Low) and not sw2
+        string heldNames = held1 and held2 ? name1 + "+" + name2 : held1 ? name1 : held2 ? name2 : ""
+        if real or smt
+            if na(t.current)
+                Setup ns = Setup.new(sec = t.sec, isCtx = t.isCtx, col = t.col, kind = real ? 0 : 1, smtWith = real ? "" : smtNames,
+                  smtHeld = real ? heldNames : "", low = t.prevLow, lowBar = t.prevLowBar, c1Time = t.prevTime, c2Time = t.curTime,
+                  c2Start = t.curStart, c2Open = t.curOpen, c2Low = t.curLow, c2LowBar = t.curLowBar, startBar = bar_index,
+                  endBar = bar_index + overshootInput, ctxOk = t.isCtx, left = 2 + (t.isCtx ? 0 : waitInput))
+                t.current := ns
+                t.drawn.push(ns)
+                if t.drawn.size() > keptInput
+                    Setup old = t.drawn.shift()
+                    line.delete(old.ln)
+                sd.syncLine(ns)
+            else
+                Setup cur = t.current
+                if real
+                    cur.kind := 0
+                    cur.smtWith := ""
+                    cur.smtHeld := heldNames
+                cur.endBar := math.max(cur.endBar, bar_index + overshootInput)
+                sd.syncLine(cur)
+    true
 
-if showStatusInput and barstate.islast
-    array<bool> activeFlags = array.from(active1, active2, active3, active4, active5, active6)
-    string activeNames = ""
-    string armedNames = ""
-    for [i, tr] in trackers
-        if activeFlags.get(i)
-            activeNames += (activeNames == "" ? "" : ", ") + tr.name
-            if tr.armedFor > 0
-                armedNames += (armedNames == "" ? "" : ", ") + tr.name
-    array<bool> rowFlags = array.from(on1, on2, on3, on4, on5, on6, on7)
-    int matched = -1
-    for [i, isOn] in rowFlags
-        if isOn and matched < 0
-            matched := i
-    statusRow(0, "Chart", tfLabel(timeframe.period))
-    statusRow(1, "Settings row", matched >= 0 ? "Row " + str.tostring(matched + 1) : "none, using HTF 1-6 checkboxes")
-    statusRow(2, "Active HTFs", activeNames == "" ? "none (nothing will be drawn)" : activeNames)
-    statusRow(3, "Coming out of", armedNames == "" ? "no swept low right now" : armedNames + " swing low")
-    statusRow(4, "CISD bias", not showCisdInput ? "CISD off" : cisdBias == 1 ? "bullish" : cisdBias == -1 ? "bearish" : "starting")
+// Pending CISD: the level price must still close through while a setup is open.
+method drawPending(Side sd) =>
+    for m in sd.machines
+        line.delete(m.pending)
+        m.pending := na
+        if showCisdInput and pendingInput and m.bias == -1 and not na(m.level)
+            if sd.setupsFor(m, bar_index, m.levelBar).size() > 0
+                float y = sd.d * m.level
+                m.pending := line.new(m.levelBar, y, bar_index, y, color = m.col, width = m.width, style = line.style_dashed)
+    true
+
+// One closed chart bar, in this side's price space.
+method step(Side sd, float o_, float h_, float l_, float c_, float a1, float a2, bool fvg) =>
+    if fvg
+        sd.lastFvgBar := bar_index
+    // 1. CISD candles that ended on the previous bar, judged against the setups as they stood then.
+    if showCisdInput
+        for m in sd.machines
+            if m.hasCur and newFor(m.sec)
+                sd.completeCandle(m)
+    // 2. Swing points, context first.
+    for t in sd.ctx
+        sd.updateTracker(t, newFor(t.sec), o_, h_, l_, c_, a1, a2)
+    for t in sd.inner
+        sd.updateTracker(t, newFor(t.sec), o_, h_, l_, c_, a1, a2)
+    // 3. Setups formed while the context is active.
+    if sd.ctxActive()
+        for t in sd.inner
+            if not na(t.current)
+                sd.markCtx(t.current)
+            for s in t.live
+                sd.markCtx(s)
+    // 4. This bar joins the forming CISD candles.
+    if showCisdInput
+        for m in sd.machines
+            if not m.hasCur
+                m.hasCur := true
+                m.curO := o_
+                m.curH := h_
+                m.curL := l_
+                m.curC := c_
+                m.curS := bar_index
+                m.curE := bar_index
+                m.curT := time
+            else
+                m.curH := math.max(m.curH, h_)
+                m.curL := math.min(m.curL, l_)
+                m.curC := c_
+                m.curE := bar_index
+    // drawPending replaces its line on every call, so only the last bar's line is ever visible: skip the rest.
+    if barstate.islast or barstate.islastconfirmedhistory
+        sd.drawPending()
+    true
+
+// Remove drawings from before the current 4H candle; keep context and setups whose window is still open.
+method clearBefore(Side sd, int since) =>
+    for m in sd.machines
+        array<line> keepMarks = array.new<line>()
+        array<bool> keepProp = array.new<bool>()
+        for [i, l] in m.marks
+            // x2 = trigger bar + extendInput; judge by the trigger bar, not the extended end.
+            if line.get_x2(l) - extendInput >= since
+                keepMarks.push(l)
+                keepProp.push(m.markIsProp.get(i))
+            else
+                line.delete(l)
+        m.marks := keepMarks
+        m.markIsProp := keepProp
+    for t in sd.ctx
+        for s in t.drawn
+            if not na(s.ln) and (s.failed or s.left <= 0)
+                line.delete(s.ln)
+                s.ln := na
+        array<line> keepHalf = array.new<line>()
+        for l in t.contLines
+            if line.get_x2(l) >= since
+                keepHalf.push(l)
+            else
+                line.delete(l)
+        t.contLines := keepHalf
+    for t in sd.inner
+        for s in t.drawn
+            if not na(s.ln) and (s.failed or s.left <= 0) and s.endBar < since
+                line.delete(s.ln)
+                s.ln := na
+    true
+
+// Aligned for the status chain: a usable context (respects "Only SMT lows"), or a setup inside the context.
+method aligned(Setup s) =>
+    s.isCtx ? s.ctxUsable() : not s.failed and s.ctxOk
+
+// One link of the alignment chain, e.g. "4H(C3)" or "30m(C2 SMT YM)"; "" when the timeframe has nothing aligned.
+// The forming C2 comes first; otherwise the first aligned setup still in its C3.
+method chainPart(Tracker t) =>
+    Setup s = na
+    if not na(t.current) and t.current.aligned()
+        s := t.current
+    for x in t.live
+        if na(s) and not x.c3Settled and x.aligned()
+            s := x
+    string out = ""
+    if not na(s)
+        string smtTxt = s.kind == 1 ? " SMT" + (s.smtWith != "" ? " " + s.smtWith : "") : ""
+        out := tfName(t.sec) + "(" + (s.isC3 ? "C3" : "C2") + smtTxt + ")"
+    else if t.contLeft > 0
+        out := tfName(t.sec) + "(continuation)"
+    out
+
+// e.g. "1D(C2) → 4H(C3) → 30m(C2 SMT YM) → 3m CISD"
+method chain(Side sd, int since) =>
+    string out = ""
+    for t in sd.ctx
+        string p = t.chainPart()
+        if p != ""
+            out += (out == "" ? "" : " → ") + p
+    for t in sd.inner
+        string p = t.chainPart()
+        if p != ""
+            out += (out == "" ? "" : " → ") + p
+    string entry = ""
+    if sd.lastEntryBar >= since
+        entry := sd.lastEntry
+    else
+        for m in sd.machines
+            if not na(m.pending) and entry == ""
+                entry := tfName(m.sec) + " CISD pending"
+    if entry != "" and out != ""
+        out += " → " + entry
+    out == "" ? "–" : out
+
+// ── Sequence helpers (table) ─────────────────────────────────
+method trackerFor(Side sd, int sec) =>
+    Tracker out = na
+    for t in sd.ctx
+        if t.sec == sec
+            out := t
+    out
+
+// The context timeframe right above the sequence timeframe (Daily above 4H), if it is on.
+method htfTracker(Side sd, int sec) =>
+    Tracker out = na
+    for t in sd.ctx
+        if t.sec > sec and (na(out) or t.sec < out.sec)
+            out := t
+    out
+
+// The C2 behind the timeframe's live candle: forming (C2), its C3 running (C3), or its C3 just closed (C4).
+method seqSetup(Tracker t) =>
+    Setup s = na
+    if not na(t.current) and t.current.ctxUsable()
+        s := t.current
+    for x in t.live
+        if na(s) and not x.c3Settled and x.ctxUsable()
+            s := x
+    if na(s) and not na(t.lastC3) and t.lastC3At == t.curStart and t.lastC3.ctxUsable()
+        s := t.lastC3
+    s
+
+phaseOf(Tracker t, Setup s) =>
+    na(s) ? (t.contLeft > 0 ? "CONT" : "–") : not s.isC3 ? "C2" : not s.c3Settled ? "C3" : "C4"
+
+// Auto direction: how far along this side's sequence is.
+method sideScore(Side sd, bool enabled, int seqSec, int since) =>
+    int sc = -1
+    if enabled
+        sc := 0
+        Tracker t = sd.trackerFor(seqSec)
+        if not na(t)
+            string ph = phaseOf(t, t.seqSetup())
+            sc += ph == "C3" ? 3 : ph == "C2" or ph == "CONT" ? 2 : ph == "C4" ? 1 : 0
+        Tracker up = sd.htfTracker(seqSec)
+        if not na(up)
+            if up.chainPart() != ""
+                sc += 1
+        if sd.lastEntryBar >= since
+            sc += 1
+    sc
+
+// Quality checks of the sequence C2. States: 1 yes, 0 no, 2 waiting, -1 not applicable.
+method qualityChecks(Side sd, Setup s, int seqSec, array<string> texts, array<int> states) =>
+    texts.clear()
+    states.clear()
+    string lowWord = sd.d == 1 ? "low" : "high"
+    if na(s)
+        for txt in array.from("C2 close vs C1", "SMT on C2", "LTF CISD inside C2", sd.d == 1 ? "C2 low in discount" : "C2 high in premium",
+              "Higher timeframe in line", "Displacement (FVG)")
+            texts.push(txt)
+            states.push(-1)
+    else
+        float px = sd.d * close
+        // 1. How C2 closed against C1.
+        if s.kind == 1
+            texts.push("C2 kept C1's " + lowWord + " (SMT)")
+            states.push(1)
+        else if not s.isC3
+            texts.push(px > s.low ? "C2 back inside C1 (so far)" : "C2 beyond C1's " + lowWord + " (so far)")
+            states.push(px > s.low ? 1 : 2)
+        else if s.typ == 1
+            texts.push("C2 closed back inside C1")
+            states.push(1)
+        else if s.c3Settled
+            texts.push("C3 closed past C2's open")
+            states.push(s.failed ? 0 : 1)
+        else
+            texts.push("C2 closed beyond C1: C3 must close past C2's open")
+            states.push(px > s.c2Open ? 1 : 2)
+        // 2. SMT with the correlated indices.
+        if not smtOn
+            texts.push("SMT on C2 (off)")
+            states.push(-1)
+        else if s.kind == 1
+            texts.push("SMT: " + s.smtWith + " took its " + lowWord + ", " + ownName + " held")
+            states.push(1)
+        else if s.smtHeld != ""
+            texts.push("SMT: " + ownName + " took it, " + s.smtHeld + " held")
+            states.push(1)
+        else
+            texts.push("No SMT on C2")
+            states.push(0)
+        // 3. A lower-timeframe CISD while C2 formed.
+        if sd.machines.size() == 0
+            texts.push("LTF CISD inside C2 (needs a 1-5m chart)")
+            states.push(-1)
+        else
+            texts.push("LTF CISD inside C2")
+            states.push(s.cisdInC2 ? 1 : s.isC3 ? 0 : 2)
+        // 4. Premium / discount against the previous day's equilibrium.
+        if na(pdEq)
+            texts.push(sd.d == 1 ? "C2 low in discount (no PD-EQ yet)" : "C2 high in premium (no PD-EQ yet)")
+            states.push(-1)
+        else
+            texts.push(sd.d == 1 ? "C2 low in discount (below PD-EQ)" : "C2 high in premium (above PD-EQ)")
+            states.push(s.c2Low < sd.d * pdEq ? 1 : 0)
+        // 5. The next higher context timeframe.
+        Tracker up = sd.htfTracker(seqSec)
+        if na(up)
+            texts.push("Higher timeframe in line (none on)")
+            states.push(-1)
+        else
+            string p = up.chainPart()
+            texts.push(p != "" ? "In line with " + p : "Not in line with " + tfName(up.sec))
+            states.push(p != "" ? 1 : 0)
+        // 6. Displacement: the move off the C2 extreme left a fair value gap.
+        texts.push("Displacement: FVG after the C2 " + lowWord)
+        states.push(sd.lastFvgBar > s.c2LowBar ? 1 : s.isC3 ? 0 : 2)
+    true
+
+// Share of the applicable checks passed, in %.
+gradeOf(array<int> states) =>
+    int yes = 0
+    int total = 0
+    for st in states
+        if st >= 0
+            total += 1
+        if st == 1
+            yes += 1
+    total == 0 ? na : math.round(yes * 100.0 / total)
+
+gradeName(float pct) =>
+    na(pct) ? "–" : pct >= 80 ? "STRONG" : pct >= 50 ? "GOOD" : "WEAK"
+
+// The setup a lane shows: the newest aligned one that is still open or belongs to this 4H candle.
+method laneSetup(Tracker t, int since) =>
+    Setup out = na
+    int n = t.drawn.size()
+    if n > 0
+        for i = n - 1 to 0
+            Setup s = t.drawn.get(i)
+            if s.ctxOk and not s.failed and (s.left > 0 or s.endBar >= since)
+                out := s
+                break
+    out
+
+// CISD timeframes a setup timeframe pairs with on this chart, e.g. "1m/3m".
+method pairText(Side sd, Tracker t) =>
+    string out = ""
+    for m in sd.machines
+        if t.pairs(m.sec)
+            out += (out == "" ? "" : "/") + tfName(m.sec)
+    out
+
+fmtTimeFor(int t, int sec) =>
+    na(t) ? "–" : str.format_time(t, sec >= 86400 ? "E dd" : "HH:mm", tzInput)
+
+// ── Display objects (rebuilt on the last bar) ────────────────
+var array<label> uiLabels = array.new<label>()
+var array<line> uiLines = array.new<line>()
+var array<box> uiBoxes = array.new<box>()
+
+clearUi() =>
+    for x in uiLabels
+        label.delete(x)
+    uiLabels.clear()
+    for x in uiLines
+        line.delete(x)
+    uiLines.clear()
+    for x in uiBoxes
+        box.delete(x)
+    uiBoxes.clear()
+    true
+
+// Text tags at the end of this 4H candle's swing, CISD and pending lines.
+method tagLines(Side sd, int since) =>
+    array<Tracker> all = sd.ctx.copy()
+    all.concat(sd.inner)
+    // x is clamped like the lines: xloc.bar_index cannot point more than 10000 bars back (a 4H candle on a 1s chart).
+    int minX = bar_index - 9999
+    for t in all
+        for s in t.drawn
+            if not na(s.ln) and line.get_x2(s.ln) >= since
+                string txt = tfName(s.sec) + (s.kind == 1 ? " SMT" + (s.smtWith != "" ? " " + s.smtWith : "") : "")
+                uiLabels.push(label.new(math.max(line.get_x2(s.ln), minX), line.get_y1(s.ln), txt, style = label.style_label_left,
+                  color = TRANSPARENT, textcolor = s.col, size = size.small))
+    for m in sd.machines
+        for [i, l] in m.marks
+            if line.get_x2(l) - extendInput >= since
+                uiLabels.push(label.new(math.max(line.get_x2(l), minX), line.get_y1(l), tfName(m.sec) + (m.markIsProp.get(i) ? " PB" : " CISD"),
+                  style = label.style_label_left, color = TRANSPARENT, textcolor = m.col, size = size.small))
+        if not na(m.pending)
+            uiLabels.push(label.new(bar_index, line.get_y1(m.pending), tfName(m.sec) + " level", style = label.style_label_left,
+              color = TRANSPARENT, textcolor = m.col, size = size.small))
+    true
+
+// ── Candle panel ─────────────────────────────────────────────
+// Adds a chart bar to a candle list: a new candle, or merged into the newest one.
+pushCandle(array<float> o, array<float> h, array<float> l, array<float> c, array<int> t, array<float> l1, array<float> h1,
+  array<float> l2, array<float> h2, bool isNew) =>
+    if isNew or o.size() == 0
+        o.push(open)
+        h.push(high)
+        l.push(low)
+        c.push(close)
+        t.push(time)
+        l1.push(a1Low)
+        h1.push(a1High)
+        l2.push(a2Low)
+        h2.push(a2High)
+        if o.size() > PANEL_CAP
+            o.shift()
+            h.shift()
+            l.shift()
+            c.shift()
+            t.shift()
+            l1.shift()
+            h1.shift()
+            l2.shift()
+            h2.shift()
+    else
+        int k = o.size() - 1
+        h.set(k, math.max(h.get(k), high))
+        l.set(k, math.min(l.get(k), low))
+        c.set(k, close)
+        l1.set(k, minNa(l1.get(k), a1Low))
+        h1.set(k, maxNa(h1.get(k), a1High))
+        l2.set(k, minNa(l2.get(k), a2Low))
+        h2.set(k, maxNa(h2.get(k), a2High))
+    true
+
+newPanel(string tf, int sec) =>
+    Panel.new(tf = tf, sec = sec, o = array.new<float>(), h = array.new<float>(), l = array.new<float>(),
+      c = array.new<float>(), t = array.new<int>(), l1 = array.new<float>(), h1 = array.new<float>(), l2 = array.new<float>(),
+      h2 = array.new<float>())
+
+buildPanels() =>
+    array<Panel> out = array.new<Panel>()
+    if pSec1 > chartSec
+        out.push(newPanel(pTf1Input, pSec1))
+    if pSec2 > chartSec
+        out.push(newPanel(pTf2Input, pSec2))
+    if pSec3 > chartSec
+        out.push(newPanel(pTf3Input, pSec3))
+    out
+
+pNewFor(string tf) =>
+    tf == pTf1Input ? pNew1 : tf == pTf2Input ? pNew2 : pNew3
+
+pCloseFor(string tf) =>
+    tf == pTf1Input ? pClose1 : tf == pTf2Input ? pClose2 : pClose3
+
+method feed(Panel p, bool isNew) =>
+    pushCandle(p.o, p.h, p.l, p.c, p.t, p.l1, p.h1, p.l2, p.h2, isNew)
+
+// The view adds the unclosed chart bar, so the newest candle moves with price.
+method buildView(Panel p, bool isNew) =>
+    p.vo := p.o.copy()
+    p.vh := p.h.copy()
+    p.vl := p.l.copy()
+    p.vc := p.c.copy()
+    p.vt := p.t.copy()
+    p.vl1 := p.l1.copy()
+    p.vh1 := p.h1.copy()
+    p.vl2 := p.l2.copy()
+    p.vh2 := p.h2.copy()
+    if not barstate.isconfirmed
+        pushCandle(p.vo, p.vh, p.vl, p.vc, p.vt, p.vl1, p.vh1, p.vl2, p.vh2, isNew)
+    true
+
+// Index of the newest C2 in direction d (same rules as the trackers): it took the previous candle's low, or a correlated
+// index took its own, and it closed back above that low, or the next candle closed above its open, or it is still forming.
+method findC2(Panel p, int d) =>
+    int found = -1
+    int n = p.vo.size()
+    if n >= 2
+        for i = n - 1 to 1
+            float lo = d == 1 ? p.vl.get(i) : -p.vh.get(i)
+            float plo = d == 1 ? p.vl.get(i - 1) : -p.vh.get(i - 1)
+            float x1 = d == 1 ? p.vl1.get(i) : -p.vh1.get(i)
+            float px1 = d == 1 ? p.vl1.get(i - 1) : -p.vh1.get(i - 1)
+            float x2 = d == 1 ? p.vl2.get(i) : -p.vh2.get(i)
+            float px2 = d == 1 ? p.vl2.get(i - 1) : -p.vh2.get(i - 1)
+            bool real = lo < plo
+            bool smt = not real and ((not na(x1) and not na(px1) and x1 < px1) or (not na(x2) and not na(px2) and x2 < px2))
+            bool closedIn = d * p.vc.get(i) > plo
+            bool reclaimed = i < n - 1 and d * p.vc.get(i + 1) > d * p.vo.get(i)
+            if smt or (real and (closedIn or reclaimed or i == n - 1))
+                found := i
+                break
+    found
+
+// Time left in the timeframe's current candle, e.g. "56:21" or "1:56:21".
+countdown(int closeMs) =>
+    int left = closeMs - timenow
+    string out = "closed"
+    if not na(left) and left > 0
+        int secs = int(left / 1000)
+        int hh = int(secs / 3600)
+        int mm = int((secs % 3600) / 60)
+        int ss = secs % 60
+        out := (hh > 0 ? str.tostring(hh) + ":" : "") + str.tostring(mm, "00") + ":" + str.tostring(ss, "00")
+    out
+
+// One timeframe's candles from bar gx onwards, with open times, C1-C4 tags, C1's swept level and a countdown title.
+method drawPanel(Panel p, int gx, int d, float pad) =>
+    int n = p.vo.size()
+    if n > 0
+        int first = math.max(0, n - pCountInput)
+        int c2 = p.findC2(d)
+        int w = pWidthInput
+        float top = na
+        for i = first to n - 1
+            int x = gx + (i - first) * (w + 1)
+            int mid = x + int(w / 2)
+            float co = p.vo.get(i)
+            float ch = p.vh.get(i)
+            float cl = p.vl.get(i)
+            float cc = p.vc.get(i)
+            color bc = cc >= co ? pUpInput : pDownInput
+            uiLines.push(line.new(mid, ch, mid, cl, color = pWickInput))
+            uiBoxes.push(box.new(x, math.max(co, cc), x + w, math.min(co, cc), border_color = bc, bgcolor = bc))
+            string tag = c2 < 0 ? "" : i == c2 - 1 ? "C1" : i == c2 ? "C2" : i == c2 + 1 ? "C3" : i == c2 + 2 ? "C4" : ""
+            string tt = fmtTimeFor(p.vt.get(i), p.sec)
+            uiLabels.push(label.new(mid, cl - pad * 0.2, tt + (tag != "" ? "\n" + tag : ""), style = label.style_label_up,
+              color = TRANSPARENT, textcolor = chart.fg_color, size = size.tiny))
+            top := na(top) ? ch : math.max(top, ch)
+        // C1's low (bearish: high), swept by C2
+        if c2 >= 1 and c2 - 1 >= first
+            float lvl = d == 1 ? p.vl.get(c2 - 1) : p.vh.get(c2 - 1)
+            int lx1 = gx + (c2 - 1 - first) * (w + 1)
+            int lx2 = gx + (math.min(n - 1, c2 + 1) - first) * (w + 1) + w
+            uiLines.push(line.new(lx1, lvl, lx2, lvl, color = d == 1 ? c3BullInput : c3BearInput, style = line.style_dashed))
+        int cx = gx + int((n - first) * (w + 1) / 2)
+        uiLabels.push(label.new(cx, top + pad * 0.2, tfName(p.sec) + "\n(" + countdown(pCloseFor(p.tf)) + ")", style = label.style_label_down,
+          color = TRANSPARENT, textcolor = chart.fg_color, size = size.normal))
+    true
+
+// ── Logic ────────────────────────────────────────────────────
+var Side bullSide = buildSide(1)
+var Side bearSide = buildSide(-1)
+var array<Panel> panels = buildPanels()
+
+// Closed bars only, so nothing repaints. The bearish side sees every price negated (highs become lows).
+if barstate.isconfirmed
+    if bullInput
+        bullSide.step(open, high, low, close, a1Low, a2Low, fvgUp)
+    if bearInput
+        bearSide.step(-open, -low, -high, -close, -a1High, -a2High, fvgDn)
+    // A new 4H candle started: drop the previous candle's entries (they were judged above, this bar).
+    if only4hInput and canTf(14400) and new4hBar
+        bullSide.clearBefore(cur4hStart)
+        bearSide.clearBefore(cur4hStart)
+    if panelInput
+        for p in panels
+            p.feed(pNewFor(p.tf))
+
+// ── Sequence table ───────────────────────────────────────────
+seqSec  = seqInput == "Daily" ? 86400 : 14400
+seqName = tfName(seqSec)
+tblSize = switch tableSizeInput
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+tablePos = switch tablePosInput
+    "Top right"    => position.top_right
+    "Bottom right" => position.bottom_right
+    "Top left"     => position.top_left
+    "Bottom left"  => position.bottom_left
+    => position.middle_right
+var table seqTable = table.new(tablePos, 3, TABLE_ROWS, bgcolor = TBL_ROW, frame_color = TBL_SEC, frame_width = 1,
+  border_color = TBL_HDR, border_width = 1)
+var bool tableMerged = false
+var array<string> qTexts = array.new<string>()
+var array<int> qStates = array.new<int>()
+
+tcell(int col, int row, string txt, color bg, color tx) =>
+    table.cell(seqTable, col, row, txt, bgcolor = bg, text_color = tx, text_size = tblSize, text_halign = text.align_left)
+
+statusCell(int row, string st) =>
+    color bg = st == "DONE" ? TBL_GOOD : st == "C2 NOW" or st == "PENDING" ? TBL_WAIT : TBL_ROW
+    tcell(2, row, st, bg, st == "DONE" or st == "C2 NOW" or st == "PENDING" ? color.white : TBL_DIM)
+
+pctFrom(float price, float base) =>
+    na(price) or na(base) or base == 0 ? na : (price - base) / base * 100
+
+pctText(float p) =>
+    (p >= 0 ? "+" : "") + str.tostring(p, "0.00") + "%"
+
+// e.g. "NQ +0.42% > ES +0.30% > YM -0.10%", strongest first.
+strengthText(float p0, float p1, float p2) =>
+    array<float> pcts = array.new<float>()
+    array<string> names = array.new<string>()
+    if not na(p0)
+        pcts.push(p0)
+        names.push(ownName)
+    if not na(p1)
+        pcts.push(p1)
+        names.push(name1)
+    if not na(p2)
+        pcts.push(p2)
+        names.push(name2)
+    string out = ""
+    if pcts.size() > 0
+        array<int> ranks = pcts.sort_indices(order.descending)
+        for idx in ranks
+            out += (out == "" ? "" : " > ") + names.get(idx) + " " + pctText(pcts.get(idx))
+    out == "" ? "–" : out
+
+if barstate.islast or barstate.islastconfirmedhistory
+    int since = canTf(14400) ? cur4hStart : 0
+    // Direction shown: the input, or the side whose sequence is further along.
+    int bs = bullSide.sideScore(bullInput, seqSec, since)
+    int rs = bearSide.sideScore(bearInput, seqSec, since)
+    int dSel = sideInput == "Bullish" ? 1 : sideInput == "Bearish" ? -1 : bs > rs ? 1 : rs > bs ? -1 :
+      bs > 0 ? (bullSide.lastEntryBar >= bearSide.lastEntryBar ? 1 : -1) : 0
+    Side sd = dSel == -1 or (dSel == 0 and not bullInput) ? bearSide : bullSide
+    string arrow = sd.d == 1 ? "▲" : "▼"
+    Tracker st = sd.trackerFor(seqSec)
+    Setup ss = na
+    string phase = "off"
+    if not na(st)
+        ss := st.seqSetup()
+        phase := phaseOf(st, ss)
+
+    if statusInput
+        string cisdTfs = ""
+        for m in sd.machines
+            cisdTfs += (cisdTfs == "" ? "" : ", ") + tfName(m.sec)
+        // Header, bias and live candle, strength, chain
+        tcell(0, 0, "◆ SEQUENCE", TBL_HDR, color.white)
+        tcell(1, 0, ownName + " · " + seqName + " sequence · " + tfName(chartSec) + " chart", TBL_HDR, color.white)
+        tcell(2, 0, "", TBL_HDR, color.white)
+        tcell(0, 1, "BIAS", TBL_ROW, TBL_TXT)
+        tcell(1, 1, dSel == 1 ? "▲ BULLISH" : dSel == -1 ? "▼ BEARISH" : "NEUTRAL", dSel == 1 ? TBL_BLUE : dSel == -1 ? TBL_BAD : TBL_SEC,
+          color.white)
+        tcell(2, 1, na(st) ? seqName + " context is off" : "LIVE " + seqName + ": " + phase,
+          phase == "C3" ? TBL_BLUE : phase == "C2" ? #455A64 : TBL_SEC, color.white)
+        tcell(0, 2, "STRENGTH", TBL_ROW, TBL_TXT)
+        tcell(1, 2, strengthText(pctFrom(close, dayOpen0), pctFrom(sym1 != "" ? o1Close : na, dayOpen1), pctFrom(sym2 != "" ? o2Close : na, dayOpen2)),
+          TBL_ROW, TBL_TXT)
+        tcell(2, 2, "", TBL_ROW, TBL_TXT)
+        tcell(0, 3, "CHAIN", TBL_ROW, TBL_TXT)
+        tcell(1, 3, sd.chain(since), TBL_ROW, TBL_TXT)
+        tcell(2, 3, "", TBL_ROW, TBL_TXT)
+
+        // C2 quality
+        sd.qualityChecks(ss, seqSec, qTexts, qStates)
+        float pct = gradeOf(qStates)
+        string c2Head = na(ss) ? "C2 QUALITY · no " + seqName + " C2 in play" :
+          "C2 QUALITY · " + seqName + " C1 " + fmtTimeFor(ss.c1Time, seqSec) + " · C2 " + fmtTimeFor(ss.c2Time, seqSec)
+        tcell(0, 4, c2Head, TBL_SEC, color.white)
+        tcell(1, 4, "", TBL_SEC, color.white)
+        tcell(2, 4, gradeName(pct) + (na(pct) ? "" : " " + str.tostring(pct, "0") + "%"),
+          na(pct) ? TBL_SEC : pct >= 80 ? TBL_GOOD : pct >= 50 ? TBL_WAIT : TBL_BAD, color.white)
+        for i = 0 to 5
+            int q = qStates.get(i)
+            string mark = q == 1 ? "✓ " : q == 0 ? "✗ " : q == 2 ? "… " : "– "
+            color tc = q == 1 ? TXT_GOOD : q == 0 ? TXT_BAD : q == 2 ? TXT_WAIT : TBL_DIM
+            tcell(0, 5 + i, mark + qTexts.get(i), TBL_ROW, tc)
+            tcell(1, 5 + i, "", TBL_ROW, tc)
+            tcell(2, 5 + i, q == 1 ? "YES" : q == 0 ? "NO" : q == 2 ? "WAIT" : "n/a", TBL_ROW, tc)
+
+        // Setup lanes: setup timeframe sweep, then the paired CISD entry
+        tcell(0, 11, "SETUP LANES · this 4H candle", TBL_SEC, color.white)
+        tcell(1, 11, "", TBL_SEC, color.white)
+        tcell(2, 11, "", TBL_SEC, color.white)
+        int row = 12
+        int stepsDone = 0
+        int stepsAll = 0
+        string entered = ""
+        bool pendingAny = false
+        for t in sd.inner
+            // Fixed letters per timeframe (spec), also when a setup timeframe is off.
+            string letter = t.sec == 3600 ? "A" : t.sec == 1800 ? "B" : "C"
+            string pt = sd.pairText(t)
+            Setup ls = t.laneSetup(since)
+            tcell(0, row, "▸ LANE " + letter, TBL_SEC, TBL_TXT)
+            tcell(1, row, tfName(t.sec) + " ▸ " + (pt != "" ? pt : "no CISD timeframe on this chart"), TBL_SEC, TBL_TXT)
+            tcell(2, row, "", TBL_SEC, TBL_TXT)
+            string sweepVal = "waiting for a sweep"
+            string sweepSt = "–"
+            bool hasEntry = false
+            string entryVal = pt == "" ? "n/a" : "–"
+            string entrySt = "–"
+            if na(ls)
+                if not na(t.current)
+                    sweepVal := "C2 outside the context"
+            else
+                sweepVal := "C1 " + fmtTime(ls.c1Time) + (ls.kind == 1 ? " · SMT " + ls.smtWith : "")
+                sweepSt := ls.isC3 ? "DONE" : "C2 NOW"
+                hasEntry := not na(ls.entryTime)
+                if pt != ""
+                    entryVal := hasEntry ? fmtTime(ls.entryTime) + " " + ls.entryTf + (na(ls.propTime) ? "" : " · PB " + fmtTime(ls.propTime)) :
+                      ls.left > 0 ? "waiting for the CISD" : "no CISD in the window"
+                    entrySt := hasEntry ? "DONE" : ls.left > 0 ? "PENDING" : "MISSED"
+                if hasEntry and ls.entryBar >= since
+                    entered += (entered == "" ? "" : "+") + letter
+            tcell(0, row + 1, tfName(t.sec) + " sweep", TBL_ROW, TBL_TXT)
+            tcell(1, row + 1, sweepVal, TBL_ROW, TBL_TXT)
+            statusCell(row + 1, sweepSt)
+            tcell(0, row + 2, (pt != "" ? pt : "CISD") + " entry", TBL_ROW, TBL_TXT)
+            tcell(1, row + 2, entryVal, TBL_ROW, TBL_TXT)
+            statusCell(row + 2, entrySt)
+            stepsAll += 2
+            stepsDone += (sweepSt == "DONE" ? 1 : 0) + (entrySt == "DONE" ? 1 : 0)
+            if entrySt == "PENDING"
+                pendingAny := true
+            row += 3
+
+        // Execution and progress
+        string exec = entered != "" ? arrow + " ENTRY " + entered + " · C2 " + gradeName(pct) : pendingAny ? arrow + " WAIT · CISD pending" :
+          phase == "–" or phase == "off" ? "NO SEQUENCE" : arrow + " WAIT · NO SETUP"
+        color execBg = entered != "" ? TBL_GOOD : pendingAny ? TBL_WAIT : TBL_SEC
+        tcell(0, row, "EXECUTION", TBL_HDR, color.white)
+        tcell(1, row, exec, execBg, color.white)
+        tcell(2, row, "", execBg, color.white)
+        string progress = ""
+        if stepsAll > 0
+            for k = 1 to stepsAll
+                progress += k <= stepsDone ? "■" : "□"
+        tcell(0, row + 1, progress, TBL_ROW, TXT_GOOD)
+        tcell(1, row + 1, "", TBL_ROW, TXT_GOOD)
+        tcell(2, row + 1, str.tostring(stepsDone) + " / " + str.tostring(stepsAll), TBL_ROW, TBL_TXT)
+        tcell(0, row + 2, "SMT vs", TBL_ROW, TBL_DIM)
+        tcell(1, row + 2, (smtOn ? name1 + (name2 != "" ? " + " + name2 : "") : "off") + " · CISD on " +
+          (cisdTfs == "" ? "none (needs a 1-5m chart)" : cisdTfs), TBL_ROW, TBL_DIM)
+        tcell(2, row + 2, "", TBL_ROW, TBL_DIM)
+        // The layout is fixed for a chart (same rows every time), so the cells are merged once.
+        if not tableMerged
+            tableMerged := true
+            table.merge_cells(seqTable, 1, 0, 2, 0)
+            table.merge_cells(seqTable, 1, 2, 2, 2)
+            table.merge_cells(seqTable, 1, 3, 2, 3)
+            for r = 4 to 10
+                table.merge_cells(seqTable, 0, r, 1, r)
+            table.merge_cells(seqTable, 0, 11, 2, 11)
+            for [li, t] in sd.inner
+                table.merge_cells(seqTable, 1, 12 + li * 3, 2, 12 + li * 3)
+            table.merge_cells(seqTable, 1, row, 2, row)
+            table.merge_cells(seqTable, 0, row + 1, 1, row + 1)
+            table.merge_cells(seqTable, 1, row + 2, 2, row + 2)
+
+    // ── Chart: candle panel, current 4H box, previous day levels, tags ──
+    if barstate.islast
+        clearUi()
+        if panelInput and panels.size() > 0
+            float hi = na
+            float lo = na
+            for p in panels
+                p.buildView(pNewFor(p.tf))
+                int n = p.vo.size()
+                if n > 0
+                    for i = math.max(0, n - pCountInput) to n - 1
+                        hi := maxNa(hi, p.vh.get(i))
+                        lo := minNa(lo, p.vl.get(i))
+            float pad = na(hi) ? 0.0 : math.max((hi - lo) * 0.06, syminfo.mintick * 4)
+            int groupW = pCountInput * (pWidthInput + 1) + 6
+            for [gi, p] in panels
+                p.drawPanel(bar_index + pOffsetInput + gi * groupW, sd.d, pad)
+
+        if box4hInput and canTf(14400) and not na(cur4hHigh)
+            Tracker t4 = sd.trackerFor(14400)
+            string ph4 = "–"
+            if not na(t4)
+                ph4 := phaseOf(t4, t4.seqSetup())
+            int endMs = time_close("240")
+            int barsLeft = na(endMs) ? 0 : math.max(0, math.min(300, int(math.ceil((endMs - time_close) / (chartSec * 1000.0)))))
+            color bx = ph4 == "C3" ? colC3BoxInput : ph4 == "C2" ? colC2BoxInput : color.new(#787B86, 94)
+            uiBoxes.push(box.new(math.max(cur4hStart, bar_index - 9999), cur4hHigh, bar_index + barsLeft, cur4hLow, border_color = TRANSPARENT,
+              bgcolor = bx))
+            if ph4 == "C3" and not na(prev4hStart) and prev4hStart < cur4hStart
+                uiBoxes.push(box.new(math.max(prev4hStart, bar_index - 9999), prev4hHigh, cur4hStart - 1, prev4hLow, border_color = TRANSPARENT,
+                  bgcolor = colC2BoxInput))
+
+        if pdInput and not na(pdHigh)
+            int left = math.max(dayStartBar, bar_index - 9999)
+            int right = bar_index + 3
+            uiLines.push(line.new(left, pdHigh, right, pdHigh, color = colPdInput))
+            uiLines.push(line.new(left, pdLow, right, pdLow, color = colPdInput))
+            uiLines.push(line.new(left, pdEq, right, pdEq, color = colPdInput, style = line.style_dotted))
+            uiLabels.push(label.new(right, pdHigh, "PDH", style = label.style_label_left, color = TRANSPARENT, textcolor = colPdInput, size = size.small))
+            uiLabels.push(label.new(right, pdLow, "PDL", style = label.style_label_left, color = TRANSPARENT, textcolor = colPdInput, size = size.small))
+            uiLabels.push(label.new(right, pdEq, "PD-EQ", style = label.style_label_left, color = TRANSPARENT, textcolor = colPdInput, size = size.small))
+
+        if tagsInput
+            int tagSince = canTf(14400) ? cur4hStart : bar_index - 200
+            if bullInput
+                bullSide.tagLines(tagSince)
+            if bearInput
+                bearSide.tagLines(tagSince)

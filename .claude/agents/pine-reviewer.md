@@ -16,9 +16,13 @@ If the caller says "report only", do phase 1 and the report, and edit nothing.
 
 Check, in this order:
 
-1. **Compile errors**: v4/v5 syntax, undeclared identifiers, missing namespaces (`ta.`, `math.`, `str.`, `request.`),
+1. **Compile errors and compiler warnings**: v4/v5 syntax, undeclared identifiers, missing namespaces (`ta.`, `math.`, `str.`, `request.`),
    wrong argument types (`simple` vs `series`), plots or alertconditions in local scope, bad indentation of wrapped lines,
    bools assigned `na`, implicit number→bool conversions.
+   Always check these two explicitly, because both slipped through a review before:
+   - `shorttitle` in `indicator()` / `strategy()` longer than 10 characters (count it).
+   - Any `method` whose first argument is never used in its body (CE10236). Check every method, one by one.
+   Treat everything in the `pine-script` skill's "Compiler checks that are easy to miss" section as part of this step.
 2. **Repainting and lookahead**: `request.security` without the `[1]` + `lookahead_on` pattern,
    `lookahead_on` without `[1]`, signals or `alert()` not gated by `barstate.isconfirmed`, undisclosed pivot delays.
 3. **Series consistency**: `ta.*` calls inside `if`, ternaries, loops, conditionally called functions, or after `and`/`or`.

@@ -39,6 +39,21 @@ Every indicator follows this order (see `../new-indicator/template.pine`):
 - `request.security()` can be called inside loops and conditionals (dynamic requests are on by default).
 - Strategies: the `when` parameter is removed; wrap calls in `if` instead.
 
+## Compiler checks that are easy to miss
+
+These have all been hit in this project. TradingView rejects or flags them even though the logic is fine.
+
+- `shorttitle` in `indicator()` / `strategy()` must be **10 characters or fewer** (SHORT_TITLE_TOO_LONG).
+  Count spaces and symbols too. Pick it when writing the header, e.g. `"Swing Pts"`, not `"Swing Points"`.
+- A `method` must **use its first argument** (CE10236). If the body only uses the other arguments, either make it
+  a plain function or turn it into a method on the type it actually works on
+  (e.g. `method ctxUsable(Setup s)` called as `s.ctxUsable()`, not `method ctxUsable(Side sd, Setup s)`).
+- `bool` fields in a `type` need a default (`bool done = false`); a bool can never be `na`.
+- Assign nested fields through a local reference: `Setup cur = t.current` then `cur.endBar := x`,
+  rather than `t.current.endBar := x`.
+- When a wrapped condition continues on the next line, end the first line with the operator (`... and`),
+  not start the next line with it.
+
 ## Series consistency
 
 - `ta.*` functions that keep internal history (`ta.sma`, `ta.ema`, `ta.rsi`, `ta.crossover`, ...) must run on

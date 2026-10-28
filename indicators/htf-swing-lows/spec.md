@@ -1,131 +1,146 @@
-# HTF Swing Lows + CISD
+# HTF Swing Points + CISD
 
 ## Purpose
-Draws horizontal lines on the chart at the lows of higher-timeframe (HTF) candles that were "swept with rejection",
-so the trader sees liquidity levels from 15m / 30m / 1h / 4h without drawing any HTF candles.
-Swing definition adapted from the sample `samples/TLM-HTF.pine` (lines ~749-750, 1189-1191).
+Marks only the entries the user's swing point model allows: a higher-timeframe swing point gives the context,
+a smaller-timeframe swing point inside it is the setup, and a valid CISD on the paired timeframe is the entry.
+Sweeps and CISDs outside that chain are not drawn. Model explained in sample_videos/Video-002.mov and Video-003.mov
+and Video_004.mov (see the trading-model memory). Version 1.0.0 replaced the v0.x "every swept low + CISD" logic;
+1.1.0 adds the continuation context, the propulsion block and an optional Weekly context.
 
-## Logic
-HTF candles are built from the chart's own bars, with boundaries from `timeframe.change(htf)`. No `request.security`.
-For each HTF, take two consecutive HTF candles, A (earlier) and B (next):
+## Swing points (C1, C2, C3)
+Bullish, on any timeframe (bearish is the exact mirror: highs instead of lows):
+- **Type 1**: C2 takes C1's low and closes back inside C1. Solid line.
+- **Type 2**: C2 takes C1's low and closes below it; it only stands if C3 then closes above C2's open. Dashed line.
+- **SMT**: C2 does not take C1's low, but a correlated index takes its own previous low in the same candle. Dotted line.
+  Correlated indices: NQ <-> ES + YM, ES <-> NQ + YM, YM <-> NQ + ES (micros map to micros), or symbols the user types.
+The line sits at C1's low, from where it was made through C3. Candles follow TradingView's own boundaries
+(futures day from 18:00 New York; 4H at 18, 22, 02, 06, 10, 14).
 
-- **Potential swing low**: B is still forming and B.low < A.low (A's low has been swept). Line is dashed.
-- **Confirmed swing low**: B has closed, B.low < A.low and B.close > A.low (swept and rejected). Line is solid.
-- If B closes at or below A.low there is no rejection, so the line is deleted.
+## Top-down chain
+1. **Context** (Weekly off by default, Daily, 4H), in the same direction, either:
+   - **C2 context**: forming a C2 or in the C3 after one (real or SMT low). Option: only SMT lows count.
+   - **Continuation context** (1.1.0, Video_004): the candle after an expansion candle, i.e. one that closed through the
+     previous candle's extreme (bearish: a close below the previous low = a failure to manipulate it). Setups count if they
+     form after the expansion candle closed and their low holds its upper half (bearish: their high stays in its lower half).
+     The expansion candle's half is drawn as a dotted line in the context colour.
+2. **Setups**: 1H / 30m / 15m C2s formed while the context is active.
+   Option (default on, "fractal"): in a C2 context the setup's C2 low must be the same price as the context C2's low.
+   A setup stays open for its C2 and C3 (+ N extra candles, default 0). Type 2 setups fail if C3 doesn't close above C2's open.
+3. **Entry**: the first valid CISD per setup on the paired timeframe: 1H -> 5m, 30m -> 3m, 15m -> 1m and 3m.
+   Valid = the run of down-close candles it closes above started inside the setup's C2 candle or later, and the CISD
+   triggers after the setup started. The setup's line is extended to the CISD.
+   CISD candles are built from chart candles, so a CISD timeframe only runs when it is a multiple of the chart timeframe
+   (1m chart: 1m, 3m, 5m; 3m chart: 3m; 5m chart: 5m).
+   Pending: while a setup is open and the CISD hasn't triggered, the level is drawn dashed to the current bar.
+4. **Propulsion block** (1.1.0): after a setup's first CISD on a timeframe, the next pullback run of opposite candles
+   (its extreme open) that price closes through again. Second entry, drawn dotted in the CISD colour, once per setup per
+   timeframe.
 
-Line geometry:
-- y = A.low
-- starts at the chart bar where A's low was made
-- ends at B's last chart bar + overshoot bars (while B is forming, at the current bar + overshoot)
-- optional small text label at the right end with the HTF name
-
-Only the last N confirmed lines per HTF are kept (older ones are deleted), plus the current potential line.
-
-## Choosing the timeframes (adapted from the sample's matrix)
-**HTF slots 1-6**: each has a checkbox, a timeframe and a line colour.
-Defaults (v0.7.0): 1 = 5m, 2 = 15m, 3 = 30m, 4 = 1h, 5 = 4h (on); 6 = 1D (off).
-
-**Show on chart timeframe**: seven rows. Each row has an on/off box, a chart timeframe, and boxes 1-6 (one per HTF slot).
-- If the chart timeframe equals the timeframe of an enabled row, that row decides which slots are drawn
-  and the slot checkboxes are ignored (a slot ticked in the row shows even if its own checkbox is off).
-- If no enabled row matches, the slot checkboxes decide.
-- A slot is only ever drawn when its timeframe is higher than the chart timeframe.
-
-Default rows:
-| Row | Chart | Slots drawn |
-|---|---|---|
-| 1 | 30s | 1 (5m), 2 (15m) |
-| 2, 3 | 1m, 3m | 2 (15m), 3 (30m) |
-| 4 | 5m | 4 (1h) |
-| 5, 6, 7 | 15m, 30m, 1h | 5 (4h) |
-
-Chart timeframes with no row (e.g. 2m, 10m, 4h) use the slot checkboxes, so they show every enabled HTF above them.
+## CISD state machine (per CISD timeframe, per direction)
+While the leg is bearish, the level is the highest open of the latest run of bearish candles (dojis skipped) that made the
+newest low; a close above it is a bullish CISD, the leg flips, and the level is taken from the bullish run. Mirror for bearish.
 
 ## Inputs
-| Group | Input | Default | Meaning |
-|---|---|---|---|
-| Higher timeframes | HTF 1-6: checkbox, timeframe, colour | see above | |
-| Show on chart timeframe | 7 rows of: on, chart timeframe, boxes 1-6 | see above | |
-| Which sweeps | Confirmed | on | Swept and the HTF candle closed back above. Solid |
-| Which sweeps | Potential | on | Swept and the HTF candle is still open. Dashed. Removed if it closes below the low |
-| Style | Line width, confirmed style, potential style | 1, Solid, Dashed | |
-| Style | Overshoot (bars) | 2 | Bars the line extends past the sweeping candle |
-| Style | Show labels | on | HTF name at the line end |
-| Style | Confirmed lines kept per timeframe | 50 | Older ones are deleted (was 5 before v0.8.0) |
+| Group | Input | Default |
+|---|---|---|
+| Context | Weekly, Daily, 4H | off, on, on |
+| Context | Continuation after an expansion candle | on |
+| Context | SMT lows count; SMT symbols (empty = automatic) | on |
+| Context | Only SMT lows | off |
+| Context | Setup low must be the context C2's low (fractal) | on |
+| Setups | 1H + CISD 5m; 30m + CISD 3m; 15m + CISD 1m / 3m | all on |
+| Setups | Extra candles after C3 | 0 |
+| Show | Only the current 4H candle | on |
+| Show | Bullish, bearish; context lines; CISD; propulsion block; pending | all on |
+| Show | Swings kept per timeframe / CISD kept per timeframe | 20 / 30 |
+| Show | Swing line overshoot / CISD extend (bars) | 2 / 0 |
+| Sequence table | Show, position, size; sequence timeframe (4H / Daily); direction (Auto / Bullish / Bearish); time zone | on, middle right, small, 4H, Auto, New York |
+| Candle panel | Show, candles (4), three timeframes (15m, 1H, 4H), distance, width, colours | on |
+| Chart context | Current 4H box (C2 / C3 colours), previous day levels, text tags | all on |
+| Colours | Weekly, Daily, 4H, 1H, 30m, 15m; CISD ▲ and ▼ per 1m / 3m / 5m | |
 
-## CISD (chart timeframe)
-Adapted from `samples/Cisd.pine`. Re-implemented, same behaviour. Always uses the chart's own candles; no HTF, no table.
+## Display (1.2.0, Video_005)
+The user trades inside the current 4H candle, so by default ("Only the current 4H candle", on) only that candle's
+entries are drawn: setup lines, CISD and propulsion lines whose trigger is in the current 4H candle, plus context and
+setups whose window is still open and the pending level. Everything older is removed when a new 4H candle starts.
+The analysis itself still runs over the whole history.
 
-State: `bias` (bullish/bearish), `level` (price), `levelBar` (where the level's open was printed), `extreme`.
-- **Level**: for a bullish bias, the lowest open of the latest run of consecutive bullish candles (dojis skipped);
-  for a bearish bias, the highest open of the latest run of bearish candles.
-- **Start**: first candle with a direction (after bar 10) sets the bias; the level comes from the run including that candle.
-- **New extreme** (bullish: new highest high; bearish: new lowest low): the level moves to the latest run of
-  bias-direction candles. If the current candle points the same way as the bias, the run includes the current candle,
-  otherwise only the run before it.
-- **Trigger**: bias bearish and close > level = bullish CISD (+CISD). Bias bullish and close < level = bearish CISD (-CISD).
-  A line is drawn at the level from `levelBar` to the trigger bar (+ extend). Then the bias flips and a new level is taken
-  from the run that includes the trigger bar.
+## Sequence table, candle panel and chart context (1.3.0)
+Layout modelled on a screenshot the user shared on 2026-10-20 (a "Fractal PO3 Seq" chart).
 
-### Only the CISD out of the current HTF swing low (v0.4.0)
-Without a gate every CISD on the chart is drawn. With "Only CISD out of an HTF swing low" on (default):
-- **Armed**: an active HTF slot becomes armed whenever its forming candle trades below the previous HTF candle's low
-  (the same sweep that draws the swing low line). Armed lasts for the sweeping candle plus N more HTF candles
-  (input "HTF candles to wait after the sweep", default 1).
-- The armed state ends early if the sweeping candle closes below the swept low (no rejection).
-  Every bullish CISD inside the window is drawn (v0.8.0; earlier text promised one per swing, which the code never did).
-- **Drawn**: a bullish CISD is drawn only while at least one HTF is armed. The label names every armed timeframe,
-  e.g. `+CISD 5m 15m` (v0.8.0; before it named only the highest). Other CISDs are not drawn; bearish CISDs are hidden until HTF swing highs exist.
-- **Pending**: while armed and the bias is bearish, the current CISD level is shown as a dashed line extended to the
-  current bar (`+CISD 30m (pending)`). It is replaced by the solid line when price closes above it, and removed if the
-  swing stops counting.
-- The CISD state machine itself (bias, level, flips) still runs on every bar; gating only decides what is drawn.
-- **Swing low with the CISD (v0.5.0)**: every pending and triggered CISD is drawn together with the HTF low it came out of:
-  a solid line in that HTF's colour at each armed swept low, from the bar where the low was made to the CISD's end,
-  labelled e.g. `5m low`, `15m low`. It is independent of the swing line settings, so the pair is visible even with swing lines turned off.
-  Input "Show the swing low the CISD comes from" (on).
+**Sequence table** (3 columns, middle right by default), for one direction: "Auto" picks the side whose sequence is
+further along (C3 = 3, C2 or continuation = 2, C4 = 1), plus 1 if the next higher context timeframe is in line and 1 if
+it has an entry in the current 4H candle. The higher score wins; on a tie the more recent entry wins; 0 : 0 is NEUTRAL.
+- **Header**: symbol · sequence timeframe (4H by default, or Daily) · chart timeframe.
+- **BIAS** and the sequence timeframe's live candle: C2 (forming), C3 (after a valid C2), C4 (the candle after that C3),
+  CONT (continuation candle after an expansion candle) or – (none).
+- **STRENGTH** (as in 1.2.0) and **CHAIN** (the alignment chain of 1.2.0).
+- **C2 QUALITY** of the sequence C2, with C1/C2 open times, graded by the share of applicable checks passed
+  (≥ 80 % STRONG, ≥ 50 % GOOD, else WEAK). Checks (yes / no / wait / n/a):
+  1. C2 closed back inside C1 (type 1), or C3 closed past C2's open (type 2), or C2 held C1's low by SMT.
+  2. SMT on C2: a correlated index took its low and this one held (SMT C2), or this one took it and a correlated index held.
+  3. A CISD on 1m / 3m / 5m in the side's direction while C2 was forming (n/a without a CISD timeframe).
+  4. C2 low in discount (below the previous day's equilibrium, PD-EQ); bearish: C2 high in premium.
+  5. The next higher context timeframe (Daily for a 4H sequence) has an aligned C2 / C3 / continuation.
+  6. Displacement: a fair value gap on the chart timeframe (bullish: low > high two bars back) after the C2 low.
+- **SETUP LANES** for each setup timeframe (A = 1H ▸ 5m, B = 30m ▸ 3m, C = 15m ▸ 1m/3m): the latest aligned setup
+  that is open or belongs to the current 4H candle. Sweep row: C1's open time (and SMT partner), DONE once C2 closed,
+  C2 NOW while it forms. Entry row: open time of the first CISD candle (+ propulsion block time), DONE, PENDING while
+  the setup's window is open, MISSED after.
+- **EXECUTION**: ENTRY with the lanes that entered in this 4H candle and the C2 grade, else WAIT (CISD pending),
+  WAIT · NO SETUP, or NO SEQUENCE; then a progress bar of sweep + entry steps done over all lanes.
+- **Footer**: SMT symbols and CISD timeframes.
 
-Inputs: show on/off, filter (Both / Bullish Only / Bearish Only), max lines kept (50), extend bars (0),
-line style and width, bullish/bearish colours, label on/off, position and size.
-The filter only hides lines; the bias still flips on hidden triggers.
-Not included from the sample: active-level plot, debug plot, multi-timeframe trend table, alerts.
+**Candle panel** (right of price, on by default): the last 4 candles of three timeframes (15m, 1H, 4H by default; any
+timeframe above the chart's), built from chart bars plus the unclosed bar. Under each candle its open time, and C1 / C2 /
+C3 / C4 around the newest C2 in the table's direction (same swing point rules, SMT included); a dashed line marks C1's
+low swept by C2. Above each group: the timeframe and a countdown to its close.
 
-## Proposed v1.0.0 (in the browser preview only, not yet in the Pine code)
-Requested 2026-10-16 after reviewing the preview:
-- **No labels** anywhere (swing lines, CISD lines, pending lines).
-- **CISD timeframe is tied to the swept HTF, not the chart timeframe**:
-  15m sweep -> 1m and 3m CISD, 30m sweep -> 3m CISD, 1H sweep -> 5m CISD (editable per HTF slot).
-  CISD candles are built from chart candles, so a CISD timeframe only works when it is a multiple of the chart timeframe
-  (e.g. on a 3m chart: 3m CISD works, 1m and 5m do not).
-- **Order**: a CISD only counts if it triggers after the sweep started, inside the sweep's window
-  (sweeping HTF candle + N more). The first CISD per sweep per CISD timeframe is drawn; later ones are ignored.
-- **One line per swept low**: lows swept by several HTFs at once (e.g. the previous 15m low is also the 30m and 1H low)
-  draw one line in the highest HTF's colour, and that sweep looks for every paired CISD (1m, 3m, 5m).
-  The sweep line runs from the low to its CISD. The separate "swing low the CISD comes from" line is removed.
-- CISD timeframes are told apart by colour and thickness: 1m light green thin, 3m green, 5m dark green thick.
-- Default rows: 1m and 3m charts show 15m, 30m, 1H sweeps; 30s shows 5m, 15m; 5m shows 1H; 15m to 1H show 4H.
+**Chart context**: the current 4H candle shaded from its open to its expected close (grey while it is a C2, blue while it is a
+C3, with the C2 before it shaded grey); the previous day's high, low and equilibrium (PDH / PDL / PD-EQ) from the day's
+open; text tags at the end of this 4H candle's lines ("30m SMT YM", "3m CISD", "3m PB" = propulsion block,
+"3m level" = pending). Tags can be turned off for price lines without text (the candle panel and PDH / PDL / PD-EQ keep theirs).
 
 ## Outputs
-Lines and optional labels (no plots), plus a status table at the bottom right (v0.6.0, can be turned off):
-chart timeframe, matched settings row, active HTFs, swing low currently being come out of, CISD bias.
+Lines, plus the text listed above (tags, candle panel). The dotted half lines follow the "Context swing lines" toggle (hiding them changes nothing else).
+Up to 1.2.0 the status table (bottom right) had:
+- **Chart**: symbol, timeframe, whether only the current 4H candle is drawn.
+- **Strength**: NQ / ES / YM ranked by % move from the trading day's open (18:00 New York), strongest first,
+  e.g. `NQ +0.42% > ES +0.30% > YM -0.10%`. Buy the strongest, sell the weakest.
+- **▲ / ▼ Alignment**: the chain for this chart's symbol, highest timeframe first, then the latest entry in the current
+  4H candle (or a pending CISD), e.g. `1D(C2) → 4H(C3) → 30m(C2 SMT YM) → 3m CISD`.
+  `SMT YM` marks a C2/C3 formed by SMT (YM took the level, this symbol did not); `continuation` marks the candle after
+  an expansion candle.
+- **CISD on**: CISD timeframes that can run on this chart. **SMT vs**: the correlated symbols.
+500-line budget shared by everything.
 
 ## Alerts
-None in this version.
+None yet.
 
 ## Repainting
-Does not repaint. All logic runs only when a chart bar is confirmed (closed), so nothing changes after the fact.
-Consequence: on the live bar, a potential (dashed) line appears when that chart bar closes, not tick by tick.
+Does not repaint: all logic runs on confirmed chart bars. Correlated indices are requested on the chart timeframe,
+so no higher-timeframe lookahead is involved.
+
+## Browser preview
+preview/engine.js implements the same rules for quick visual checks on NQ / ES / YM sample data. TradingView is the source of truth.
+
+## Not yet included (from Video-003, waiting for definitions)
+Dealing-range premium/discount, failure vs relevant swings as targets, SMT agreeing with the daily,
+CISD quality (weak candles), fair value gaps (strength / entries), choosing the asset by position vs the daily open.
 
 ## Acceptance checks
-- With default settings: 3m chart shows only 15m and 30m lines, 5m only 1h, 1h only 4h.
-- Untick HTF 2 and a row's box 2 separately to confirm that a matching row overrides the slot checkbox, and that
-  an unmatched chart timeframe (e.g. 2m) follows the slot checkboxes.
-- CISD: compare a few +CISD / -CISD lines against the original "CISD by tncylyv" on the same symbol and timeframe.
-  Lines should start and end on the same bars. Set Filter to "Bullish Only" and confirm that bearish ones disappear.
-- Turn off Confirmed: only dashed lines remain. Turn off Potential: lines appear only once the HTF candle closes.
-- A solid line sits exactly at an HTF candle's low, and the next HTF candle (check with the 15m/1h chart) has a lower low
-  and closes above that level. The line ends just after that candle.
-- A dashed line appears only while the current HTF candle has traded below the previous HTF candle's low.
-- If the next HTF candle swept the low and closed below it, no line exists for that candle.
-- Bar Replay through a day: lines that were drawn earlier do not move or disappear, except potential lines that
-  either become solid or are removed when their HTF candle closes.
+- 1.3.0: the sequence table fills every row; the candle panel shows 15m / 1H / 4H to the right with times, C-tags and
+  countdowns; the 4H box turns blue in a C3; PDH / PDL / PD-EQ start at the day's open; "Text tags" off removes the tags.
+- Status table: Strength ranks three indices; ▲/▼ Alignment chains end with the current 4H entry or a pending CISD;
+  on a 3m chart "CISD on: 3m", on 1m "1m, 3m, 5m".
+- Only CISD/propulsion lines from the current 4H candle are on the chart; turning the option off shows the history.
+- NQ 13 Oct 2026 ~08:30-09:00 New York (Video_005): ▼ chain should read like 1D(C2) → ... → 30m(C2 SMT YM) → 3m CISD.
+- With "Text tags" off, no text on swing or CISD lines; one line per swept low (a low shared by 15m and 30m is drawn once, in the 30m colour).
+- Every green CISD line has an open 15m / 30m / 1H setup line just before it, inside an active Daily/4H context.
+- YM 15 Oct 2026 around 10:00 New York on 3m: the 30m 9:30 setup and the 3m CISD from Video-002 should appear.
+- Turning off "fractal" adds entries; turning on "Only SMT lows" removes most.
+- Bar Replay: lines never change after the bar closes.
+- NQ 12 Oct 2026 around 12:00 New York (Video_004): bearish 3m CISD around 12:12 and its dotted propulsion block around
+  12:21 on a 3m chart; 5m CISD around 12:05 and propulsion around 12:20 on a 5m chart (preview measurements).
+- Measured in the preview (30 days, both directions, default filters): NQ 3m about 15 entries a day without continuation,
+  about 25 with it; propulsion blocks are about a third of all entries.
