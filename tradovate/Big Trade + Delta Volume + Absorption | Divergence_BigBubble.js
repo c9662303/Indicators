@@ -244,6 +244,104 @@ function buildHtfCandle(bars) {
     };
 }
 
+// ── ABSORBED BIG ORDERS → CISD ───────────────────────────────────────────────
+// A big order is a bubble (same threshold and price grouping as the chart
+// bubbles). Big sellers are absorbed when no candle closes below their zone and
+// price then makes a bullish CISD: a close above the highest open of the latest
+// run of down-close candles, with the sellers' zone below that level. Big buyers
+// mirror it with a bearish CISD. Judged on closed candles only.
+const ABSORB_COLORS = { bull: '#52D4FC', bear: '#FD7070' };
+// Colour of the candle that makes the CISD.
+const CISD_CANDLE_COLORS = { bull: '#22C55E', bear: '#EF4444' };
+
+// Copy of the absorption state, so the forming candle can be judged without
+// changing what the closed candles have built up.
+function cloneAbsState(st) {
+    return {
+        sell: st.sell.slice(),
+        buy: st.buy.slice(),
+        downRun: st.downRun ? Object.assign({}, st.downRun) : null,
+        upRun: st.upRun ? Object.assign({}, st.upRun) : null,
+        lastDir: st.lastDir,
+    };
+}
+
+// One closed candle: records its big orders, drops the ones price closed
+// through (they worked) or that are too old, and returns the CISDs that
+// absorbed big orders on the other side.
+function stepAbsorption(st, bar, threshold, modSize, tolerance, maxBars) {
+    const events = [];
+    const { i, o, c, groups } = bar;
+
+    groups.forEach(({ price, bidVol, askVol }) => {
+        const delta = askVol - bidVol;
+        if (delta < -threshold) st.sell.push({ bar: i, low: price, high: price + modSize, delta });
+        if (delta > threshold)  st.buy.push({ bar: i, low: price, high: price + modSize, delta });
+    });
+    st.sell = st.sell.filter(b => i - b.bar <= maxBars && c >= b.low - tolerance);
+    st.buy  = st.buy.filter(b => i - b.bar <= maxBars && c <= b.high + tolerance);
+
+    const dir = c > o ? 1 : c < o ? -1 : 0;
+
+    // Bullish CISD absorbing big sellers
+    if (dir === 1 && st.downRun && c > st.downRun.level) {
+        const level = st.downRun.level;
+        const absorbed = st.sell.filter(b => b.low < level);
+        if (absorbed.length > 0) {
+            events.push({ side: 'bull', bar: i, level, start: st.downRun.start, orders: absorbed });
+            st.sell = st.sell.filter(b => absorbed.indexOf(b) < 0);
+        }
+        st.downRun = null;
+    }
+    // Bearish CISD absorbing big buyers
+    if (dir === -1 && st.upRun && c < st.upRun.level) {
+        const level = st.upRun.level;
+        const absorbed = st.buy.filter(b => b.high > level);
+        if (absorbed.length > 0) {
+            events.push({ side: 'bear', bar: i, level, start: st.upRun.start, orders: absorbed });
+            st.buy = st.buy.filter(b => absorbed.indexOf(b) < 0);
+        }
+        st.upRun = null;
+    }
+
+    // Runs of same-direction candles (dojis skipped); the newest run is the reference.
+    if (dir === -1) {
+        if (st.lastDir === -1 && st.downRun) st.downRun.level = Math.max(st.downRun.level, o);
+        else st.downRun = { start: i, level: o };
+    }
+    if (dir === 1) {
+        if (st.lastDir === 1 && st.upRun) st.upRun.level = Math.min(st.upRun.level, o);
+        else st.upRun = { start: i, level: o };
+    }
+    if (dir !== 0) st.lastDir = dir;
+
+    return events;
+}
+
+// The zone of the absorbed orders around their average price: the average is
+// weighted by each order's size (|delta|), and every order whose middle lies
+// within one standard deviation of it (at least one bubble's height) is
+// included, above or below. The zone spans those orders and is clipped at the
+// CISD level, so a bullish zone sits below the line and a bearish one above it.
+function absorbedZone(ev, modSize) {
+    const pts = ev.orders.map(b => ({ b, mid: (b.low + b.high) / 2, w: Math.abs(b.delta) }));
+    const total = pts.reduce((s, p) => s + p.w, 0);
+    const avg = pts.reduce((s, p) => s + p.mid * p.w, 0) / total;
+    const sd = Math.sqrt(pts.reduce((s, p) => s + p.w * (p.mid - avg) * (p.mid - avg), 0) / total);
+    const band = Math.max(sd, modSize);
+    const near = pts.filter(p => Math.abs(p.mid - avg) <= band).map(p => p.b);
+    const zone = {
+        avg,
+        low: Math.min(...near.map(b => b.low)),
+        high: Math.max(...near.map(b => b.high)),
+        delta: near.reduce((s, b) => s + b.delta, 0),
+        firstBar: Math.min(...near.map(b => b.bar)),
+    };
+    if (ev.side === 'bull') zone.high = Math.min(zone.high, ev.level);
+    else zone.low = Math.max(zone.low, ev.level);
+    return zone;
+}
+
 class BigTradeDeltaAbsorption {
     init() {
         // --- Big Trade Bubbles / Price Axis Delta state ---
@@ -264,6 +362,11 @@ class BigTradeDeltaAbsorption {
         this.htfCurHour = null;
         this.htfPrevHour = null;
         this.htfMaxDelta = {};    // per HTF timeframe, for bubble sizing
+
+        // --- Absorbed big orders → CISD state ---
+        this.absState = { sell: [], buy: [], downRun: null, upRun: null, lastDir: 0 };
+        this.absIndex = null;     // bar currently being mapped
+        this.absLastBar = null;   // its latest data (added to absState once the next bar starts)
 
         console.log('BigTradeDeltaAbsorption (RewiredSanjay): Initialization started');
     }
@@ -599,92 +702,6 @@ class BigTradeDeltaAbsorption {
             }
         }
 
-        // ── ABSORPTION / DIVERGENCE ──────────────────────────────────────────
-        // Flags bars where price closes in one direction while order-flow
-        // delta (ask volume - bid volume) moves the opposite way.
-        const offerVol = d.offerVolume();
-        const bidVol = d.bidVolume();
-        const deltaValue = offerVol - bidVol;
-        const deltaText = deltaValue.toFixed(0);
-
-        const upCandleCheck = d.close() > d.open();
-        const downCandleCheck = d.close() < d.open();
-
-        // Bullish absorption: price closed up, but delta was negative (selling absorbed).
-        // Bearish absorption: price closed down, but delta was positive (buying absorbed).
-        const bullDiv = deltaValue < 0 && upCandleCheck;
-        const bearDiv = deltaValue > 0 && downCandleCheck;
-
-        const deltaDisplayMode = this.props.displayDelta;
-        const isShowAll = deltaDisplayMode === 'showAll';
-        const isShowOnlyDivergence = deltaDisplayMode === 'showOnlyDivergence';
-        const isNone = deltaDisplayMode === 'none';
-
-        let bullishDivergence = null;
-        let bearishDivergence = null;
-
-        if (!isNone) {
-            if (bullDiv) bullishDivergence = true;
-            if (bearDiv) bearishDivergence = true;
-        }
-
-        // Divergence icon dot positions
-        let bullishDivergencePosition = null;
-        let bearishDivergencePosition = null;
-
-        if (this.props.showDivergenceIcon) {
-            if (bullDiv) {
-                bullishDivergencePosition = d.low() - (this.contractInfo.tickSize * this.props.divergenceIconSpacing);
-            }
-            if (bearDiv) {
-                bearishDivergencePosition = d.high() + (this.contractInfo.tickSize * this.props.divergenceIconSpacing);
-            }
-        }
-
-        const absXOffset = 0.02;
-        const absFontSize = this.props.deltaFontSize;
-        const modifiedSizeAbove = this.contractInfo.tickSize * this.props.deltaTextSpacing;
-        const modifiedSizeBelow = this.contractInfo.tickSize * (this.props.deltaTextSpacing + 1);
-
-        const hasDivergence = bullishDivergence !== null || bearishDivergence !== null;
-        const filterMinDelta = this.props.filterMinDelta || 0;
-        const meetsMinDeltaFilter = Math.abs(deltaValue) >= filterMinDelta;
-        const shouldShowDeltaText = !isNone && meetsMinDeltaFilter && (isShowAll || (isShowOnlyDivergence && hasDivergence));
-
-        const absorptionTextContainer = {
-            tag: "Container",
-            key: "absorptionTextContainer",
-            children: [],
-            conditions: {},
-        };
-
-        if (shouldShowDeltaText) {
-            let labelAnchor;
-            let textColor;
-
-            if (hasDivergence) {
-                labelAnchor = bullishDivergence ? d.low() - modifiedSizeBelow : d.high() + modifiedSizeAbove;
-                textColor = bullishDivergence ? this.props.sellingAbsorptionText : this.props.buyingAbsorptionText;
-            } else {
-                labelAnchor = upCandleCheck ? d.low() - modifiedSizeBelow : d.high() + modifiedSizeAbove;
-                textColor = this.props.neutralDeltaText;
-            }
-
-            const absTextPt = {
-                x: op(du(d.index()), '-', du(absXOffset)),
-                y: du(labelAnchor),
-            };
-
-            absorptionTextContainer.children.push({
-                tag: "Text",
-                key: `absorptionTextKey${d.index()}`,
-                text: deltaText,
-                point: absTextPt,
-                style: { fontSize: absFontSize, fill: textColor },
-                textAlignment: "centerMiddle",
-            });
-        }
-
         const items = [
             volCircles,
             bubbleTextContainer,
@@ -693,7 +710,16 @@ class BigTradeDeltaAbsorption {
             combinedBars,
             combinedText,
         ];
-        if (shouldShowDeltaText) items.push(absorptionTextContainer);
+
+        // ── ABSORBED BIG ORDERS → CISD ───────────────────────────────────────
+        let cisdCandleColor = null;
+        if (this.props.EnableAbsorbedCisd !== false) {
+            const absorb = this.updateAbsorption(d);
+            if (absorb) {
+                items.push(absorb.container);
+                cisdCandleColor = absorb.candleColor;
+            }
+        }
 
         // ── HTF CANDLES ──────────────────────────────────────────────────────
         if (this.props.EnableHtfCandles && barUtcMs != null) {
@@ -701,11 +727,66 @@ class BigTradeDeltaAbsorption {
             if (d.isLast()) items.push(this.drawHtfCandles(d));
         }
 
-        return {
+        const result = {
             graphics: { items },
-            bullishDivergence: bullishDivergencePosition,
-            bearishDivergence: bearishDivergencePosition,
         };
+        if (cisdCandleColor) result.candlestick = { color: cisdCandleColor };
+        return result;
+    }
+
+    // Adds the previous candle to the state once it has closed (when this bar
+    // first appears), then judges this candle as it stands. If it makes a CISD
+    // that absorbed big orders, it is coloured green (bullish) or red (bearish),
+    // the absorbed orders around their average price get a box (below the CISD
+    // level for longs, above for shorts) and each absorbed bubble an ✕.
+    // On the forming candle this updates with price; it is final once it closes.
+    updateAbsorption(d) {
+        const idx  = d.index();
+        const tick = this.contractInfo.tickSize;
+        const modSize = tick * this.props.priceLevelsPerBar;
+
+        // Settings added after the indicator was put on a chart can arrive
+        // empty; fall back to the defaults instead of silently matching nothing.
+        const num = (v, fallback) => (typeof v === 'number' && isFinite(v) ? v : fallback);
+        const maxBars   = num(this.props.AbsorbMaxBars, 20);
+        const tolerance = num(this.props.AbsorbToleranceTicks, 0) * tick;
+        const threshold = num(this.props.RthVolThreshold, 155);
+
+        if (idx !== this.absIndex) {
+            if (this.absLastBar) stepAbsorption(this.absState, this.absLastBar, threshold, modSize, tolerance, maxBars);
+            this.absIndex = idx;
+        }
+        this.absLastBar = {
+            i: idx, o: d.open(), c: d.close(),
+            groups: combineLevels(d.profile(), modSize),
+        };
+        const events = stepAbsorption(cloneAbsState(this.absState), this.absLastBar, threshold, modSize, tolerance, maxBars);
+
+        if (events.length === 0) return null;
+        const container = { tag: 'Container', key: `absorb_${idx}`, children: [] };
+        events.forEach(ev => {
+            const color = ABSORB_COLORS[ev.side];
+            const zone  = absorbedZone(ev, modSize);
+            container.children.push({
+                tag: 'Shapes', key: `absorb_zone_${ev.side}_${ev.bar}`,
+                primitives: [{
+                    tag: 'Rectangle',
+                    position: { x: du(zone.firstBar - 0.5), y: du(zone.low) },
+                    size: { height: du(zone.high - zone.low), width: du(ev.bar - zone.firstBar + 1) }
+                }],
+                fillStyle: { color, opacity: 25 }
+            });
+            ev.orders.forEach(b => {
+                container.children.push({
+                    tag: 'Text', key: `absorb_x_${b.bar}_${b.low}`,
+                    text: '✕',
+                    point: { x: op(du(b.bar), '-', du(0.02)), y: du(b.low + modSize / 2) },
+                    style: { fontSize: 16, fill: color },
+                    textAlignment: 'centerMiddle'
+                });
+            });
+        });
+        return { container, candleColor: CISD_CANDLE_COLORS[events[events.length - 1].side] };
     }
 
     // Keeps this bar (OHLC + volume profile) while it belongs to the previous or
@@ -842,9 +923,9 @@ class BigTradeDeltaAbsorption {
 }
 
 // Base line style, extended below with dark-mode colors for the divergence
-// dots. (The original absorption indicator accidentally declared
-// `schemeStyles` twice in one object literal, which silently discarded the
-// solidLine default — this merges both correctly.)
+// dots. The divergence dots and delta numbers were removed; the two plots stay
+// declared (they never receive values, so nothing is drawn) to keep the
+// indicator's plot setup unchanged in Tradovate.
 const baseScheme = predef.styles.solidLine("#000") || {};
 const mergedSchemeStyles = Object.assign({}, baseScheme, {
     dark: Object.assign({}, baseScheme.dark, {
@@ -883,6 +964,12 @@ module.exports = {
         EnableBubbleLabels: predef.paramSpecs.bool(true),
         priceLevelsPerBar:  predef.paramSpecs.number(6,   1, 1),
 
+        // ── ABSORBED BIG ORDERS → CISD ───────────────────────────────────────
+        dividerAbs:         predef.paramSpecs.enum({ s: '━━━━━━━━━━  ABSORBED BIG ORDERS → CISD  ━━━━━━━━━━' }, 's'),
+        EnableAbsorbedCisd: predef.paramSpecs.bool(true),
+        AbsorbMaxBars:      predef.paramSpecs.number(20, 1, 1),
+        AbsorbToleranceTicks: predef.paramSpecs.number(0, 1, 0),
+
         // ── HTF CANDLES ───────────────────────────────────────────────────────
         dividerHtf:         predef.paramSpecs.enum({ s: '━━━━━━━━━━  HTF CANDLES (30m / 1H)  ━━━━━━━━━━' }, 's'),
         EnableHtfCandles:   predef.paramSpecs.bool(true),
@@ -908,22 +995,6 @@ module.exports = {
         EnableVolumeBars:   predef.paramSpecs.bool(false),
         VolumeBarColor:     predef.paramSpecs.color('#FFFFFF'),
         VolumeBarOpacity:   predef.paramSpecs.number(40, 1, 0),
-
-        // ── ABSORPTION / DIVERGENCE ──────────────────────────────────────────
-        divider4:           predef.paramSpecs.enum({ s: '━━━━━━━━━━  ABSORPTION / DIVERGENCE  ━━━━━━━━━━' }, 's'),
-        sellingAbsorptionText: predef.paramSpecs.color("#FD7070"),
-        buyingAbsorptionText: predef.paramSpecs.color("#52D4FC"),
-        neutralDeltaText:    predef.paramSpecs.color("#CFCFCF"),
-        deltaTextSpacing:    predef.paramSpecs.number(30),
-        displayDelta:        predef.paramSpecs.enum({
-            none: 'None',
-            showOnlyDivergence: 'Show Only Delta Divergence',
-            showAll: 'Show All Delta'
-        }, 'showOnlyDivergence'),
-        filterMinDelta:      predef.paramSpecs.number(50),
-        showDivergenceIcon:  predef.paramSpecs.bool(true),
-        divergenceIconSpacing: predef.paramSpecs.number(15),
-        deltaFontSize:       predef.paramSpecs.number(12),
     },
     tags: ["RewiredSanjay"],
     schemeStyles: mergedSchemeStyles,
