@@ -974,10 +974,10 @@ module.exports = {
         // ── BUBBLES ───────────────────────────────────────────────────────────
         divider1:           predef.paramSpecs.enum({ s: '━━━━━━━━━━  BIG TRADE BUBBLES  ━━━━━━━━━━' }, 's'),
         EnableBubbles:      predef.paramSpecs.bool(true),
-        positiveDeltaColor: predef.paramSpecs.color('#1D4ED8'),
-        negativeDeltaColor: predef.paramSpecs.color('#EA580C'),
+        positiveDeltaColor: predef.paramSpecs.color('#00CCB4'),
+        negativeDeltaColor: predef.paramSpecs.color('#9900CC'),
         RthVolThreshold:    predef.paramSpecs.number(155, 1, 0),
-        BubbleOpacity:      predef.paramSpecs.number(90,  1, 0),
+        BubbleOpacity:      predef.paramSpecs.number(65,  1, 0),
         BubbleSize:         predef.paramSpecs.number(10, 1, 1),
         EnableBubbleLabels: predef.paramSpecs.bool(true),
         priceLevelsPerBar:  predef.paramSpecs.number(6,   1, 1),
